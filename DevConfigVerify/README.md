@@ -27,6 +27,7 @@ If execution policy blocks the script, start it with `pwsh -ExecutionPolicy Bypa
 | `-Baseline` | none | Earlier report folder to show side by side with this run. |
 | `-OutputPath` | `%USERPROFILE%\DevConfigReports\<experience>-<timestamp>` | Report folder. |
 | `-NoScreenshots` | off | Run only the checks. |
+| `-NoSmokeTests` | off | Skip the PowerToys smoke test. |
 | `-NoOpen` | off | Don't open the report when finished. |
 
 It exits with `0` when nothing failed and `1` otherwise, so it also works in automation.
@@ -55,6 +56,27 @@ Each step gets one of three results:
 
   It closes every window it opened. Folder Options is closed without applying anything.
 - **Baseline.** `-Baseline` puts a previous run's results and screenshots beside the current ones and flags every check whose status changed. A clean-VM run makes a good golden baseline.
+
+## PowerToys smoke test
+
+When the workload includes PowerToys, the script also checks every sparse MSIX package PowerToys uses for package identity. These packages hold only a manifest; their binaries stay in the PowerToys install folder.
+
+| Package | What it powers |
+| --- | --- |
+| `Microsoft.PowerToys.PowerRenameContextMenu` | PowerRename on the Windows 11 context menu |
+| `Microsoft.PowerToys.ImageResizerContextMenu` | Image Resizer on the Windows 11 context menu |
+| `Microsoft.PowerToys.FileLocksmithContextMenu` | File Locksmith on the Windows 11 context menu |
+| `Microsoft.PowerToys.NewPlusContextMenu` | New+ on the Windows 11 context menu |
+| `Microsoft.PowerToys.SparseApp` | Identity for Settings, Image Resizer, Advanced Paste (UI and CLI), and the Command Palette extension |
+
+For each package it checks that:
+
+- The package is registered for the current user with status `Ok`. A context menu package must also match the installed PowerToys version exactly, which is the same rule PowerToys uses to decide whether to re-register.
+- Its external location exists inside the current PowerToys folder, which catches registrations left pointing at an old install.
+- Every executable and COM DLL its installed manifest declares is present.
+- For context menu packages, it activates each handler out of process, as Explorer does, and reads its menu title (for example, "Rename with PowerRename"). The command itself is never invoked.
+
+A context menu package whose module is turned off in PowerToys is reported as skipped, not failed, because PowerToys registers it only while the module is on. The script also reports whether PowerToys is running.
 
 Output folder:
 

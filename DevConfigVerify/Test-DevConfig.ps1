@@ -27,6 +27,10 @@
   installs to %ProgramData%\CalmOS, then to a windows-dev-config folder next to this script.
   Point it at <clone>\src\windows-dev-config to verify a branch.
 
+.PARAMETER NoSmokeTests
+  Skips the PowerToys smoke test, which checks each sparse MSIX package PowerToys registers and
+  loads every Windows 11 context menu handler out of process to read its menu title.
+
 .PARAMETER Baseline
   A previous report folder, for example one from a known-good machine. Its results and
   screenshots are shown next to this run's.
@@ -48,6 +52,7 @@ param(
     [string] $OutputPath,
     [string] $Baseline,
     [switch] $NoScreenshots,
+    [switch] $NoSmokeTests,
     [switch] $NoOpen
 )
 
@@ -65,7 +70,7 @@ try {
     Write-Verbose "Could not force UTF-8 console encoding: $($_.Exception.Message)"
 }
 
-$VerifyToolVersion = '1.2.0'
+$VerifyToolVersion = '1.3.0'
 
 if ($Workload -ne 'devconfig' -and -not $PSBoundParameters.ContainsKey('Experience')) {
     $Experience = 'Full'
@@ -604,6 +609,7 @@ function Add-VerifyResult {
         'Pass'  { [string][char]0x2713, 'Green' }
         'Warn'  { '!', 'Yellow' }
         'Fail'  { [string][char]0x2717, 'Red' }
+        'Skip'  { '-', 'DarkGray' }
         default { '?', 'Magenta' }
     }
     $actual = $Result.Actual
@@ -617,6 +623,268 @@ function Add-VerifyResult {
     }
     if ($Result.Message) {
         Write-Host ('    {0}' -f $Result.Message) -ForegroundColor DarkGray
+    }
+}
+
+#endregion
+
+#region PowerToys smoke test
+
+# Sparse MSIX packages give these PowerToys pieces package identity from files in the install folder.
+# Context menu packages are registered by their module when it's enabled; the installer registers SparseApp.
+$Script:VerifyPowerToysSparsePackages = @(
+    @{ Name = 'PowerRenameContextMenu';   Title = 'PowerRename context menu';    Package = 'Microsoft.PowerToys.PowerRenameContextMenu';   Module = 'PowerRename';    ContextMenu = $true }
+    @{ Name = 'ImageResizerContextMenu';  Title = 'Image Resizer context menu';  Package = 'Microsoft.PowerToys.ImageResizerContextMenu';  Module = 'Image Resizer';  ContextMenu = $true }
+    @{ Name = 'FileLocksmithContextMenu'; Title = 'File Locksmith context menu'; Package = 'Microsoft.PowerToys.FileLocksmithContextMenu'; Module = 'File Locksmith'; ContextMenu = $true }
+    @{ Name = 'NewPlusContextMenu';       Title = 'New+ context menu';           Package = 'Microsoft.PowerToys.NewPlusContextMenu';       Module = 'NewPlus';        ContextMenu = $true }
+    @{ Name = 'SparseApp';                Title = 'Shared package identity';     Package = 'Microsoft.PowerToys.SparseApp';                Module = $null;            ContextMenu = $false }
+)
+
+$comProbeSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+[ComImport, Guid("a08ce4d0-fa25-44ab-b57c-c7b1c323e0b9"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IDevConfigVerifyExplorerCommand
+{
+    [PreserveSig] int GetTitle(IntPtr items, [MarshalAs(UnmanagedType.LPWStr)] out string name);
+}
+
+public sealed class DevConfigVerifyCommandProbe
+{
+    public bool Ok;
+    public string Title = "";
+    public string Error = "";
+}
+
+// Activates a packaged context menu handler out of process, the way Explorer does, and asks for its title.
+// The command itself is never invoked.
+public static class DevConfigVerifyExplorerCommand
+{
+    [DllImport("ole32.dll")]
+    private static extern int CoCreateInstance(ref Guid clsid, IntPtr outer, uint context, ref Guid iid,
+        [MarshalAs(UnmanagedType.IUnknown)] out object instance);
+
+    public static DevConfigVerifyCommandProbe GetTitle(Guid clsid)
+    {
+        var probe = new DevConfigVerifyCommandProbe();
+        Guid iid = typeof(IDevConfigVerifyExplorerCommand).GUID;
+        object instance;
+        const uint LocalServer = 4;
+        int hr = CoCreateInstance(ref clsid, IntPtr.Zero, LocalServer, ref iid, out instance);
+        if (hr != 0)
+        {
+            probe.Error = "the handler didn't activate (0x" + hr.ToString("X8") + ")";
+            return probe;
+        }
+        try
+        {
+            string title;
+            hr = ((IDevConfigVerifyExplorerCommand)instance).GetTitle(IntPtr.Zero, out title);
+            if (hr != 0) { probe.Error = "the handler didn't return a title (0x" + hr.ToString("X8") + ")"; }
+            else { probe.Ok = true; probe.Title = title ?? ""; }
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(instance);
+        }
+        return probe;
+    }
+}
+'@
+
+function Invoke-VerifyExplorerCommandTitle {
+    param([string] $Clsid)
+    if (-not ('DevConfigVerifyExplorerCommand' -as [type])) {
+        Add-Type -TypeDefinition $comProbeSource
+    }
+    # A separate runspace keeps a hung handler from stalling the whole run.
+    $shell = [PowerShell]::Create()
+    [void]$shell.AddScript('param($Clsid) [DevConfigVerifyExplorerCommand]::GetTitle([guid]$Clsid)').AddArgument($Clsid)
+    $pending = $shell.BeginInvoke()
+    if (-not $pending.AsyncWaitHandle.WaitOne(30000)) {
+        return [pscustomobject]@{ Ok = $false; Title = ''; Error = 'the handler timed out after 30 seconds' }
+    }
+    try {
+        $output = @($shell.EndInvoke($pending))
+        if ($output.Count -eq 0) {
+            $reason = if ($shell.Streams.Error.Count) { $shell.Streams.Error[0].Exception.Message } else { 'no result' }
+            return [pscustomobject]@{ Ok = $false; Title = ''; Error = $reason }
+        }
+        return $output[0]
+    } finally {
+        $shell.Dispose()
+    }
+}
+
+function Get-VerifyPowerToysInstall {
+    $candidates = @(
+        Get-Process -Name PowerToys -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Path } catch { $null } }
+        Join-Path $env:LOCALAPPDATA 'PowerToys\PowerToys.exe'
+        Join-Path $env:ProgramFiles 'PowerToys\PowerToys.exe'
+        foreach ($root in @('HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')) {
+            foreach ($key in Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue) {
+                $location = [string]$key.GetValue('InstallLocation')
+                if ($location -and [string]$key.GetValue('DisplayName') -match '^PowerToys') { Join-Path $location 'PowerToys.exe' }
+            }
+        }
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) }
+    $exe = $candidates | Select-Object -First 1
+    if (-not $exe) { return $null }
+    $info = (Get-Item -LiteralPath $exe).VersionInfo
+    return [pscustomobject]@{
+        Directory = (Split-Path -Parent $exe).TrimEnd('\')
+        Version   = [version]('{0}.{1}.{2}.{3}' -f $info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart)
+        Running   = @(Get-Process -Name PowerToys -ErrorAction SilentlyContinue).Count -gt 0
+    }
+}
+
+# Module on/off state from PowerToys' general settings; missing keys mean "unknown".
+function Get-VerifyPowerToysModuleState {
+    $state = @{}
+    $path = Join-Path $env:LOCALAPPDATA 'Microsoft\PowerToys\settings.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $state }
+    try {
+        $settings = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+        if ($settings.PSObject.Properties['enabled']) {
+            foreach ($module in $settings.enabled.PSObject.Properties) { $state[$module.Name] = [bool]$module.Value }
+        }
+    } catch {
+        Write-Verbose "Could not read PowerToys settings: $($_.Exception.Message)"
+    }
+    return $state
+}
+
+function Test-VerifySparsePackage {
+    param([hashtable] $Definition, $Install, [hashtable] $ModuleState, [bool] $SupportsContextMenus)
+
+    $result = New-VerifyResult -Name $Definition.Name -Title $Definition.Title -Kind 'Smoke'
+    $result.Detail = $Definition.Package
+    $result.Expected = if ($Definition.ContextMenu) { "Registered at $($Install.Version), handler loads" } else { "Registered, apps present" }
+
+    if ($Definition.ContextMenu -and -not $SupportsContextMenus) {
+        $result.Status = 'Skip'
+        $result.Actual = 'Windows 10 uses the classic context menu'
+        return $result
+    }
+    $moduleOff = $Definition.Module -and $ModuleState.ContainsKey($Definition.Module) -and -not $ModuleState[$Definition.Module]
+    $package = Get-AppxPackage -Name $Definition.Package -ErrorAction SilentlyContinue | Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1
+    if (-not $package) {
+        if ($moduleOff) {
+            $result.Status = 'Skip'
+            $result.Actual = "$($Definition.Module) is turned off, so it isn't registered"
+        } else {
+            $result.Actual = 'Not registered'
+            $result.Message = if ($Definition.ContextMenu) {
+                'PowerToys registers this when the module is enabled; an untrusted signature also blocks it.'
+            } else {
+                'The PowerToys installer registers this; an untrusted signature also blocks it.'
+            }
+        }
+        return $result
+    }
+
+    $problems = [System.Collections.Generic.List[string]]::new()
+    if ([string]$package.Status -ne 'Ok') { $problems.Add("package status is $($package.Status)") }
+    $packageVersion = [version]$package.Version
+    # PowerToys re-registers a context menu package whenever its version differs from PowerToys.
+    if ($Definition.ContextMenu -and $packageVersion -ne $Install.Version) {
+        $problems.Add("version $packageVersion doesn't match PowerToys $($Install.Version)")
+    }
+
+    # For sparse packages, the repository key's PackageRootFolder is the external location that holds the binaries.
+    $repository = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages'
+    $entry = Get-ItemProperty -LiteralPath (Join-Path $repository $package.PackageFullName) -ErrorAction SilentlyContinue
+    $external = if ($entry -and $entry.PSObject.Properties['PackageRootFolder']) { ([string]$entry.PackageRootFolder).TrimEnd('\') } else { '' }
+    if (-not $external -or -not (Test-Path -LiteralPath $external -PathType Container)) {
+        $problems.Add("its external location is missing ($(if ($external) { $external } else { 'not recorded' }))")
+    } elseif (-not ($external + '\').StartsWith($Install.Directory + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        $problems.Add("it points outside the PowerToys folder ($external)")
+    }
+
+    # Every executable and COM DLL the installed manifest declares must exist in the external location.
+    [xml]$manifest = [IO.File]::ReadAllText((Join-Path $package.InstallLocation 'AppxManifest.xml'))
+    $declared = @(
+        $manifest.SelectNodes('//*[local-name()="Application"]') | ForEach-Object { $_.GetAttribute('Executable') }
+        $manifest.SelectNodes('//*[local-name()="Class"]') | ForEach-Object { $_.GetAttribute('Path') }
+        $manifest.SelectNodes('//*[local-name()="ExeServer"]') | ForEach-Object { $_.GetAttribute('Executable') }
+    ) | Where-Object { $_ } | Select-Object -Unique
+    if ($external -and (Test-Path -LiteralPath $external -PathType Container)) {
+        $missing = @($declared | Where-Object { -not (Test-Path -LiteralPath (Join-Path $external $_) -PathType Leaf) })
+        if ($missing.Count) { $problems.Add("missing $($missing -join ', ')") }
+    }
+
+    $evidence = ''
+    if ($Definition.ContextMenu) {
+        $clsids = @($manifest.SelectNodes('//*[local-name()="FileExplorerContextMenus"]//*[local-name()="Verb"]') |
+            ForEach-Object { $_.GetAttribute('Clsid') } | Where-Object { $_ } | Select-Object -Unique)
+        $titles = @()
+        foreach ($clsid in $clsids) {
+            $probe = Invoke-VerifyExplorerCommandTitle -Clsid $clsid
+            if ($probe.Ok) { $titles += "'$($probe.Title)'" } else { $problems.Add($probe.Error) }
+        }
+        if ($titles.Count) { $evidence = "Menu entry: $($titles -join ', ')" }
+    } else {
+        $apps = @($manifest.SelectNodes('//*[local-name()="Application"]') | ForEach-Object { $_.GetAttribute('Id') -replace '^PowerToys\.', '' })
+        if ($apps.Count) { $evidence = "Identity for $($apps -join ', ')" }
+    }
+
+    $result.Probe = $evidence
+    if ($problems.Count) {
+        $result.Status = 'Fail'
+        $result.Actual = "Registered $packageVersion, but broken"
+        $result.Message = ($problems -join '; ') + '.'
+    } else {
+        $result.Status = 'Pass'
+        $result.Actual = "Registered $packageVersion"
+    }
+    return $result
+}
+
+function Invoke-VerifyPowerToysSmokeTest {
+    $install = Get-VerifyPowerToysInstall
+    if (-not $install) {
+        $skipped = New-VerifyResult -Name 'PowerToysInstall' -Title 'PowerToys install' -Kind 'Smoke'
+        $skipped.Status = 'Skip'
+        $skipped.Expected = 'PowerToys installed'
+        $skipped.Actual = "PowerToys isn't installed"
+        Add-VerifyResult -Result $skipped
+        return
+    }
+
+    $installed = New-VerifyResult -Name 'PowerToysInstall' -Title 'PowerToys install' -Kind 'Smoke'
+    $installed.Status = 'Pass'
+    $installed.Expected = 'PowerToys installed'
+    $installed.Actual = "PowerToys $($install.Version)"
+    $installed.Detail = $install.Directory
+    Add-VerifyResult -Result $installed
+
+    # Modules register their context menu packages from the running PowerToys process.
+    $runner = New-VerifyResult -Name 'PowerToysRunning' -Title 'PowerToys is running' -Kind 'Smoke'
+    $runner.Expected = 'Running'
+    if ($install.Running) {
+        $runner.Status = 'Pass'
+        $runner.Actual = 'Running'
+    } else {
+        $runner.Status = 'Warn'
+        $runner.Actual = 'Not running'
+        $runner.Message = 'Start PowerToys so enabled modules can register their context menus, then run this again.'
+    }
+    Add-VerifyResult -Result $runner
+
+    $moduleState = Get-VerifyPowerToysModuleState
+    $supportsContextMenus = [Environment]::OSVersion.Version.Build -ge 22000
+    foreach ($definition in $Script:VerifyPowerToysSparsePackages) {
+        try {
+            Add-VerifyResult -Result (Test-VerifySparsePackage -Definition $definition -Install $install -ModuleState $moduleState -SupportsContextMenus $supportsContextMenus)
+        } catch {
+            $failed = New-VerifyResult -Name $definition.Name -Title $definition.Title -Kind 'Smoke'
+            $failed.Status = 'Error'
+            $failed.Actual = "Couldn't check"
+            $failed.Detail = $definition.Package
+            $failed.Message = $_.Exception.Message
+            Add-VerifyResult -Result $failed
+        }
     }
 }
 
@@ -1071,6 +1339,7 @@ function Get-VerifyStatusLabel {
         'Pass'  { 'Pass' }
         'Warn'  { 'Set up differently' }
         'Fail'  { 'Fail' }
+        'Skip'  { 'Skipped' }
         default { "Couldn't check" }
     }
 }
@@ -1167,7 +1436,7 @@ code{font:12px ui-monospace,"Cascadia Mono",Consolas,monospace}
 .Fail td.actual,.Error td.actual{color:var(--fail)}.Warn td.actual{color:var(--warn)}
 tr.changed td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
 .tag{font-size:11px;color:var(--warn);border:1px solid currentColor;border-radius:999px;padding:0 7px;margin-left:6px;white-space:nowrap}
-body.issues tr.Pass,body.issues .allpass{display:none}
+body.issues tr.Pass,body.issues tr.Skip,body.issues .allpass{display:none}
 ul.mini{list-style:none;margin:0;padding:12px 20px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:6px 24px;font-size:13.5px}
 ul.mini li{display:flex;gap:10px}
 ul.mini .dot{margin-top:6px}
@@ -1206,6 +1475,8 @@ footer{margin-top:64px;color:var(--muted);font-size:12px}
     if ($summary.Updates -gt 0) { [void]$html.Append("<span class=""pill""><b>$($summary.Updates)</b> updates available</span>") }
     if ($summary.Fail -gt 0) { [void]$html.Append("<span class=""pill""><b>$($summary.Fail)</b> failed</span>") }
     if ($summary.Error -gt 0) { [void]$html.Append("<span class=""pill""><b>$($summary.Error)</b> couldn&#39;t check</span>") }
+    # Older results files have no Skip count.
+    if ($summary.Contains('Skip') -and $summary.Skip -gt 0) { [void]$html.Append("<span class=""pill""><b>$($summary.Skip)</b> skipped</span>") }
     [void]$html.Append('<label class="filter"><input type="checkbox" id="issues"> Show only issues</label></div>')
 
     # Checks, grouped by phase in run order.
@@ -1215,7 +1486,8 @@ footer{margin-top:64px;color:var(--muted);font-size:12px}
     foreach ($phaseTitle in $phaseOrder) {
         $rows = @($Report.Results | Where-Object { $_.Phase -eq $phaseTitle })
         $passed = @($rows | Where-Object { $_.Status -eq 'Pass' }).Count
-        [void]$html.Append("<div class=""card$(if ($passed -eq $rows.Count) { ' allpass' })""><header><h3>$(& $e $phaseTitle)</h3><span class=""muted"">$passed of $($rows.Count) pass</span></header><table>")
+        $clear = @($rows | Where-Object { $_.Status -notin @('Pass', 'Skip') }).Count -eq 0
+        [void]$html.Append("<div class=""card$(if ($clear) { ' allpass' })""><header><h3>$(& $e $phaseTitle)</h3><span class=""muted"">$passed of $($rows.Count) pass</span></header><table>")
         if ($hasBaseline) {
             [void]$html.Append('<colgroup><col style="width:40%"><col style="width:20%"><col style="width:20%"><col style="width:20%"></colgroup>')
         } else {
@@ -1256,7 +1528,7 @@ footer{margin-top:64px;color:var(--muted);font-size:12px}
         [void]$html.Append("<section><h2>Visual check</h2><p class=""lede"">$lede</p>")
         foreach ($panel in $Report.Panels) {
             $panelResults = @($Report.Results | Where-Object { @($panel.Steps) -contains $_.Name })
-            $allPass = @($panelResults | Where-Object { $_.Status -ne 'Pass' }).Count -eq 0
+            $allPass = @($panelResults | Where-Object { $_.Status -notin @('Pass', 'Skip') }).Count -eq 0
             [void]$html.Append("<div class=""card panel$(if ($allPass) { ' allpass' })""><header><h3>$(& $e $panel.Title)</h3><code class=""muted"">$(& $e $panel.Source)</code></header><ul class=""mini"">")
             foreach ($item in $panelResults) {
                 [void]$html.Append("<li class=""$($item.Status)""><i class=""dot""></i><span>$(& $e $item.Title) <span class=""muted"">&middot; $(& $e $item.Actual)</span></span></li>")
@@ -1335,6 +1607,21 @@ foreach ($phase in $phases) {
 }
 
 $panels = @()
+if (-not $NoSmokeTests -and @($Script:VerifyResults | Where-Object { $_.Name -eq 'PowerToys' }).Count -gt 0) {
+    $Script:DevConfigPhaseTitle = 'PowerToys smoke test'
+    Write-Host ''
+    Write-Host 'PowerToys smoke test' -ForegroundColor Cyan
+    try {
+        Invoke-VerifyPowerToysSmokeTest
+    } catch {
+        $failed = New-VerifyResult -Name 'PowerToysSmokeTest' -Title 'PowerToys smoke test'
+        $failed.Status = 'Error'
+        $failed.Actual = "Couldn't check"
+        $failed.Message = $_.Exception.Message
+        Add-VerifyResult -Result $failed
+    }
+}
+
 if (-not $NoScreenshots) {
     Write-Host ''
     Write-Host 'Capturing screenshots' -ForegroundColor Cyan
@@ -1352,6 +1639,7 @@ $summary = [ordered]@{
     Warn  = @($results | Where-Object { $_.Status -eq 'Warn' }).Count
     Fail  = @($results | Where-Object { $_.Status -eq 'Fail' }).Count
     Error = @($results | Where-Object { $_.Status -eq 'Error' }).Count
+    Skip  = @($results | Where-Object { $_.Status -eq 'Skip' }).Count
     Updates = @($results | Where-Object { $_.UpdateAvailable }).Count
 }
 $signature = Get-AuthenticodeSignature -FilePath $orchestratorPath
@@ -1380,7 +1668,7 @@ $htmlPath = Join-Path $OutputPath 'report.html'
 
 Write-Host ''
 $color = if ($summary.Fail + $summary.Error -gt 0) { 'Red' } elseif ($summary.Warn -gt 0) { 'Yellow' } else { 'Green' }
-Write-Host ("{0} passed, {1} set up differently, {2} failed, {3} couldn't check, {4} updates available" -f $summary.Pass, $summary.Warn, $summary.Fail, $summary.Error, $summary.Updates) -ForegroundColor $color
+Write-Host ("{0} passed, {1} set up differently, {2} failed, {3} couldn't check, {4} skipped, {5} updates available" -f $summary.Pass, $summary.Warn, $summary.Fail, $summary.Error, $summary.Skip, $summary.Updates) -ForegroundColor $color
 Write-Host "Report: $htmlPath" -ForegroundColor DarkGray
 
 if (-not $NoOpen) {
