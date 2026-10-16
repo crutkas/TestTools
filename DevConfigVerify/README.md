@@ -73,12 +73,12 @@ For each package it checks that:
 
 - The package is registered for the current user with status `Ok`. A context menu package must also match the installed PowerToys version exactly, which is the same rule PowerToys uses to decide whether to re-register.
 - Its external location exists inside the current PowerToys folder, which catches registrations left pointing at an old install.
-- Every executable and COM DLL its installed manifest declares is present.
+- Every file it needs at run time is present: the COM DLLs for a context menu package, and every app executable and COM server for `SparseApp`. A context menu package's `Application` entry is a placeholder that Explorer never launches, so it isn't checked.
 - For context menu packages, it activates each handler out of process, as Explorer does, and reads its menu title (for example, "Rename with PowerRename"). The command itself is never invoked.
 
 A context menu package whose module is turned off in PowerToys is reported as skipped, not failed, because PowerToys registers it only while the module is on. New+ is off by default.
 
-If PowerToys isn't running, the script starts it and waits up to 90 seconds for enabled modules to register their packages and for Command Palette to launch. On a fresh install, the first start may open PowerToys' welcome window.
+If PowerToys isn't running, the script starts it and waits up to 90 seconds for enabled modules to register their packages and for Command Palette to launch, then allows 10 more seconds for the registrations to settle. On a fresh install, the first start may open PowerToys' welcome window.
 
 ### Command Palette
 

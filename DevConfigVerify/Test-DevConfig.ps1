@@ -72,7 +72,7 @@ try {
     Write-Verbose "Could not force UTF-8 console encoding: $($_.Exception.Message)"
 }
 
-$VerifyToolVersion = '1.5.0'
+$VerifyToolVersion = '1.5.1'
 
 if ($Workload -ne 'devconfig' -and -not $PSBoundParameters.ContainsKey('Experience')) {
     $Experience = 'Full'
@@ -855,10 +855,13 @@ function Test-VerifySparsePackage {
         $problems.Add("it points outside the PowerToys folder ($external)")
     }
 
-    # Every executable and COM DLL the installed manifest declares must exist in the external location.
+    # Every file the installed manifest needs at run time must exist in the external location. Context menu
+    # packages declare an Application only because every package needs one; Explorer loads just their COM DLL.
     [xml]$manifest = [IO.File]::ReadAllText((Join-Path $package.InstallLocation 'AppxManifest.xml'))
     $declared = @(
-        $manifest.SelectNodes('//*[local-name()="Application"]') | ForEach-Object { $_.GetAttribute('Executable') }
+        if (-not $Definition.ContextMenu) {
+            $manifest.SelectNodes('//*[local-name()="Application"]') | ForEach-Object { $_.GetAttribute('Executable') }
+        }
         $manifest.SelectNodes('//*[local-name()="Class"]') | ForEach-Object { $_.GetAttribute('Path') }
         $manifest.SelectNodes('//*[local-name()="ExeServer"]') | ForEach-Object { $_.GetAttribute('Executable') }
     ) | Where-Object { $_ } | Select-Object -Unique
@@ -930,7 +933,12 @@ function Invoke-VerifyPowerToysSmokeTest {
                 $runner.Status = 'Pass'
                 $runner.Actual = 'Started by this check'
                 $pending = Wait-VerifyPowerToysReady -Install $install
-                if ($pending.Count) { $runner.Message = "Still waiting after 90 seconds on: $($pending -join ', ')." }
+                if ($pending.Count) {
+                    $runner.Message = "Still waiting after 90 seconds on: $($pending -join ', ')."
+                } else {
+                    # Give fresh registrations a moment to settle before they're checked.
+                    Start-Sleep -Seconds 10
+                }
             } else {
                 $runner.Status = 'Fail'
                 $runner.Actual = "Didn't start within 30 seconds"
