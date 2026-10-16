@@ -1,0 +1,7 @@
+# Verification reports can contain screenshots of personal data.
+DevConfigReports/
+report.html
+results.json
+screenshots/
+# Bundled copy of the setup definitions; copy it in when needed instead of committing it.
+DevConfigVerify/windows-dev-config/
