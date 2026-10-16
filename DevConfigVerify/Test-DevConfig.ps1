@@ -28,9 +28,10 @@
   Point it at <clone>\src\windows-dev-config to verify a branch.
 
 .PARAMETER NoSmokeTests
-  Skips the smoke tests. The PowerToys test checks each sparse MSIX package PowerToys registers and
-  loads every Windows 11 context menu handler out of process to read its menu title. The Coreutils
-  test runs "ls -al" directly, through Command Prompt, and through Coreutils' PowerShell hook.
+  Skips the smoke tests. The PowerToys test starts PowerToys if needed, checks each sparse MSIX
+  package it registers, loads every Windows 11 context menu handler out of process to read its
+  menu title, and checks Command Palette and its PowerToys extension. The Coreutils test runs
+  "ls -al" directly, through Command Prompt, and through Coreutils' PowerShell hook.
 
 .PARAMETER Baseline
   A previous report folder, for example one from a known-good machine. Its results and
@@ -71,7 +72,7 @@ try {
     Write-Verbose "Could not force UTF-8 console encoding: $($_.Exception.Message)"
 }
 
-$VerifyToolVersion = '1.4.0'
+$VerifyToolVersion = '1.5.0'
 
 if ($Workload -ne 'devconfig' -and -not $PSBoundParameters.ContainsKey('Experience')) {
     $Experience = 'Full'
@@ -634,12 +635,13 @@ function Add-VerifyResult {
 
 # Sparse MSIX packages give these PowerToys pieces package identity from files in the install folder.
 # Context menu packages are registered by their module when it's enabled; the installer registers SparseApp.
+# DefaultOn mirrors PowerToys' defaults for when settings.json has no entry yet.
 $Script:VerifyPowerToysSparsePackages = @(
-    @{ Name = 'PowerRenameContextMenu';   Title = 'PowerRename context menu';    Package = 'Microsoft.PowerToys.PowerRenameContextMenu';   Module = 'PowerRename';    ContextMenu = $true }
-    @{ Name = 'ImageResizerContextMenu';  Title = 'Image Resizer context menu';  Package = 'Microsoft.PowerToys.ImageResizerContextMenu';  Module = 'Image Resizer';  ContextMenu = $true }
-    @{ Name = 'FileLocksmithContextMenu'; Title = 'File Locksmith context menu'; Package = 'Microsoft.PowerToys.FileLocksmithContextMenu'; Module = 'File Locksmith'; ContextMenu = $true }
-    @{ Name = 'NewPlusContextMenu';       Title = 'New+ context menu';           Package = 'Microsoft.PowerToys.NewPlusContextMenu';       Module = 'NewPlus';        ContextMenu = $true }
-    @{ Name = 'SparseApp';                Title = 'Shared package identity';     Package = 'Microsoft.PowerToys.SparseApp';                Module = $null;            ContextMenu = $false }
+    @{ Name = 'PowerRenameContextMenu';   Title = 'PowerRename context menu';    Package = 'Microsoft.PowerToys.PowerRenameContextMenu';   Module = 'PowerRename';    DefaultOn = $true;  ContextMenu = $true }
+    @{ Name = 'ImageResizerContextMenu';  Title = 'Image Resizer context menu';  Package = 'Microsoft.PowerToys.ImageResizerContextMenu';  Module = 'Image Resizer';  DefaultOn = $true;  ContextMenu = $true }
+    @{ Name = 'FileLocksmithContextMenu'; Title = 'File Locksmith context menu'; Package = 'Microsoft.PowerToys.FileLocksmithContextMenu'; Module = 'File Locksmith'; DefaultOn = $true;  ContextMenu = $true }
+    @{ Name = 'NewPlusContextMenu';       Title = 'New+ context menu';           Package = 'Microsoft.PowerToys.NewPlusContextMenu';       Module = 'NewPlus';        DefaultOn = $false; ContextMenu = $true }
+    @{ Name = 'SparseApp';                Title = 'Shared package identity';     Package = 'Microsoft.PowerToys.SparseApp';                Module = $null;            DefaultOn = $true;  ContextMenu = $false }
 )
 
 $comProbeSource = @'
@@ -659,10 +661,12 @@ public sealed class DevConfigVerifyCommandProbe
     public string Error = "";
 }
 
-// Activates a packaged context menu handler out of process, the way Explorer does, and asks for its title.
-// The command itself is never invoked.
+// Activates packaged COM classes out of process, the way Explorer and Command Palette do.
+// Context menu commands are only asked for their title; they are never invoked.
 public static class DevConfigVerifyExplorerCommand
 {
+    private const uint LocalServer = 4;
+
     [DllImport("ole32.dll")]
     private static extern int CoCreateInstance(ref Guid clsid, IntPtr outer, uint context, ref Guid iid,
         [MarshalAs(UnmanagedType.IUnknown)] out object instance);
@@ -672,7 +676,6 @@ public static class DevConfigVerifyExplorerCommand
         var probe = new DevConfigVerifyCommandProbe();
         Guid iid = typeof(IDevConfigVerifyExplorerCommand).GUID;
         object instance;
-        const uint LocalServer = 4;
         int hr = CoCreateInstance(ref clsid, IntPtr.Zero, LocalServer, ref iid, out instance);
         if (hr != 0)
         {
@@ -692,20 +695,36 @@ public static class DevConfigVerifyExplorerCommand
         }
         return probe;
     }
+
+    public static DevConfigVerifyCommandProbe Activate(Guid clsid)
+    {
+        var probe = new DevConfigVerifyCommandProbe();
+        Guid iid = new Guid("00000000-0000-0000-C000-000000000046");
+        object instance;
+        int hr = CoCreateInstance(ref clsid, IntPtr.Zero, LocalServer, ref iid, out instance);
+        if (hr != 0)
+        {
+            probe.Error = "the COM server didn't start (0x" + hr.ToString("X8") + ")";
+            return probe;
+        }
+        Marshal.ReleaseComObject(instance);
+        probe.Ok = true;
+        return probe;
+    }
 }
 '@
 
-function Invoke-VerifyExplorerCommandTitle {
-    param([string] $Clsid)
+# A separate runspace keeps a hung COM server from stalling the whole run.
+function Invoke-VerifyComProbe {
+    param([ValidateSet('GetTitle', 'Activate')] [string] $Method, [string] $Clsid)
     if (-not ('DevConfigVerifyExplorerCommand' -as [type])) {
         Add-Type -TypeDefinition $comProbeSource
     }
-    # A separate runspace keeps a hung handler from stalling the whole run.
     $shell = [PowerShell]::Create()
-    [void]$shell.AddScript('param($Clsid) [DevConfigVerifyExplorerCommand]::GetTitle([guid]$Clsid)').AddArgument($Clsid)
+    [void]$shell.AddScript("param(`$Clsid) [DevConfigVerifyExplorerCommand]::$Method([guid]`$Clsid)").AddArgument($Clsid)
     $pending = $shell.BeginInvoke()
     if (-not $pending.AsyncWaitHandle.WaitOne(30000)) {
-        return [pscustomobject]@{ Ok = $false; Title = ''; Error = 'the handler timed out after 30 seconds' }
+        return [pscustomobject]@{ Ok = $false; Title = ''; Error = 'it timed out after 30 seconds' }
     }
     try {
         $output = @($shell.EndInvoke($pending))
@@ -717,6 +736,38 @@ function Invoke-VerifyExplorerCommandTitle {
     } finally {
         $shell.Dispose()
     }
+}
+
+function Test-VerifyPowerToysModuleOn {
+    param([string] $Module, [bool] $DefaultOn, [hashtable] $ModuleState)
+    if (-not $Module) { return $true }
+    if ($ModuleState.ContainsKey($Module)) { return [bool]$ModuleState[$Module] }
+    return $DefaultOn
+}
+
+# After starting PowerToys, enabled modules register their packages and Command Palette launches.
+function Wait-VerifyPowerToysReady {
+    param($Install, [int] $TimeoutSeconds = 90)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $supportsContextMenus = [Environment]::OSVersion.Version.Build -ge 22000
+    do {
+        Start-Sleep -Seconds 3
+        $moduleState = Get-VerifyPowerToysModuleState
+        $pending = @(
+            if ($supportsContextMenus) {
+                foreach ($definition in $Script:VerifyPowerToysSparsePackages | Where-Object { $_.ContextMenu }) {
+                    if (-not (Test-VerifyPowerToysModuleOn -Module $definition.Module -DefaultOn $definition.DefaultOn -ModuleState $moduleState)) { continue }
+                    $current = Get-AppxPackage -Name $definition.Package -ErrorAction SilentlyContinue | Where-Object { [version]$_.Version -eq $Install.Version }
+                    if (-not $current) { $definition.Title }
+                }
+            }
+            if ((Test-VerifyPowerToysModuleOn -Module 'CmdPal' -DefaultOn $true -ModuleState $moduleState) -and
+                -not (Get-Process -Name 'Microsoft.CmdPal.UI' -ErrorAction SilentlyContinue)) {
+                'Command Palette'
+            }
+        )
+    } while ($pending.Count -and [DateTime]::UtcNow -lt $deadline)
+    return , $pending
 }
 
 function Get-VerifyPowerToysInstall {
@@ -769,7 +820,7 @@ function Test-VerifySparsePackage {
         $result.Actual = 'Windows 10 uses the classic context menu'
         return $result
     }
-    $moduleOff = $Definition.Module -and $ModuleState.ContainsKey($Definition.Module) -and -not $ModuleState[$Definition.Module]
+    $moduleOff = -not (Test-VerifyPowerToysModuleOn -Module $Definition.Module -DefaultOn $Definition.DefaultOn -ModuleState $ModuleState)
     $package = Get-AppxPackage -Name $Definition.Package -ErrorAction SilentlyContinue | Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1
     if (-not $package) {
         if ($moduleOff) {
@@ -822,7 +873,7 @@ function Test-VerifySparsePackage {
             ForEach-Object { $_.GetAttribute('Clsid') } | Where-Object { $_ } | Select-Object -Unique)
         $titles = @()
         foreach ($clsid in $clsids) {
-            $probe = Invoke-VerifyExplorerCommandTitle -Clsid $clsid
+            $probe = Invoke-VerifyComProbe -Method GetTitle -Clsid $clsid
             if ($probe.Ok) { $titles += "'$($probe.Title)'" } else { $problems.Add($probe.Error) }
         }
         if ($titles.Count) { $evidence = "Menu entry: $($titles -join ', ')" }
@@ -861,19 +912,38 @@ function Invoke-VerifyPowerToysSmokeTest {
     $installed.Detail = $install.Directory
     Add-VerifyResult -Result $installed
 
-    # Modules register their context menu packages from the running PowerToys process.
+    # Modules register their context menu packages and launch Command Palette from the running PowerToys process.
     $runner = New-VerifyResult -Name 'PowerToysRunning' -Title 'PowerToys is running' -Kind 'Smoke'
     $runner.Expected = 'Running'
     if ($install.Running) {
         $runner.Status = 'Pass'
         $runner.Actual = 'Running'
     } else {
-        $runner.Status = 'Warn'
-        $runner.Actual = 'Not running'
-        $runner.Message = 'Start PowerToys so enabled modules can register their context menus, then run this again.'
+        Write-Host '  Starting PowerToys and waiting for its modules to come up...' -ForegroundColor DarkGray
+        try {
+            Start-Process -FilePath (Join-Path $install.Directory 'PowerToys.exe')
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            while (-not (Get-Process -Name PowerToys -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $deadline) {
+                Start-Sleep -Milliseconds 500
+            }
+            if (Get-Process -Name PowerToys -ErrorAction SilentlyContinue) {
+                $runner.Status = 'Pass'
+                $runner.Actual = 'Started by this check'
+                $pending = Wait-VerifyPowerToysReady -Install $install
+                if ($pending.Count) { $runner.Message = "Still waiting after 90 seconds on: $($pending -join ', ')." }
+            } else {
+                $runner.Status = 'Fail'
+                $runner.Actual = "Didn't start within 30 seconds"
+            }
+        } catch {
+            $runner.Status = 'Fail'
+            $runner.Actual = "Couldn't start"
+            $runner.Message = $_.Exception.Message
+        }
     }
     Add-VerifyResult -Result $runner
 
+    # PowerToys creates settings.json on first start, so module state is read after starting it.
     $moduleState = Get-VerifyPowerToysModuleState
     $supportsContextMenus = [Environment]::OSVersion.Version.Build -ge 22000
     foreach ($definition in $Script:VerifyPowerToysSparsePackages) {
@@ -888,6 +958,132 @@ function Invoke-VerifyPowerToysSmokeTest {
             Add-VerifyResult -Result $failed
         }
     }
+
+    try {
+        Invoke-VerifyCommandPaletteChecks -ModuleState $moduleState
+    } catch {
+        $failed = New-VerifyResult -Name 'CmdPal' -Title 'Command Palette' -Kind 'Smoke'
+        $failed.Status = 'Error'
+        $failed.Actual = "Couldn't check"
+        $failed.Message = $_.Exception.Message
+        Add-VerifyResult -Result $failed
+    }
+}
+
+# Every installed package that declares a Command Palette extension, with the COM class Command Palette activates.
+function Get-VerifyCmdPalExtension {
+    foreach ($package in Get-AppxPackage -ErrorAction SilentlyContinue) {
+        try {
+            if (-not $package.InstallLocation) { continue }
+            $path = Join-Path $package.InstallLocation 'AppxManifest.xml'
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $text = [IO.File]::ReadAllText($path)
+            if ($text.IndexOf('com.microsoft.commandpalette', [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            [xml]$manifest = $text
+            foreach ($extension in $manifest.SelectNodes('//*[local-name()="AppExtension"][@Name="com.microsoft.commandpalette"]')) {
+                $create = $extension.SelectSingleNode('.//*[local-name()="CreateInstance"]')
+                [pscustomobject]@{
+                    Package = $package.Name
+                    Id      = $extension.GetAttribute('Id')
+                    ClassId = $(if ($create) { $create.GetAttribute('ClassId') } else { '' })
+                }
+            }
+        } catch {
+            Write-Verbose "Could not read the manifest for $($package.Name): $($_.Exception.Message)"
+        }
+    }
+}
+
+function Invoke-VerifyCommandPaletteChecks {
+    param([hashtable] $ModuleState)
+    $enabled = Test-VerifyPowerToysModuleOn -Module 'CmdPal' -DefaultOn $true -ModuleState $ModuleState
+
+    $packageRow = New-VerifyResult -Name 'CmdPalPackage' -Title 'Command Palette package' -Kind 'Smoke'
+    $packageRow.Expected = 'Registered, status Ok'
+    $package = Get-AppxPackage -Name 'Microsoft.CommandPalette' -ErrorAction SilentlyContinue | Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1
+    if (-not $package) {
+        if ($enabled) {
+            $packageRow.Actual = 'Not registered'
+            $packageRow.Message = 'PowerToys installs Command Palette from WinUI3Apps\CmdPal when the module is enabled.'
+        } else {
+            $packageRow.Status = 'Skip'
+            $packageRow.Actual = 'Command Palette is turned off in PowerToys'
+        }
+        Add-VerifyResult -Result $packageRow
+        return
+    }
+    $packageRow.Detail = $package.PackageFullName
+    if ([string]$package.Status -eq 'Ok') {
+        $packageRow.Status = 'Pass'
+        $packageRow.Actual = "Registered $($package.Version)"
+    } else {
+        $packageRow.Actual = "Registered $($package.Version), status $($package.Status)"
+        $packageRow.Message = 'A status other than Ok usually means a missing dependency or a damaged install.'
+    }
+    Add-VerifyResult -Result $packageRow
+
+    # PowerToys starts Command Palette in the background with x-cmdpal://background when the module is on.
+    $runningRow = New-VerifyResult -Name 'CmdPalRunning' -Title 'Command Palette is running' -Kind 'Smoke'
+    $runningRow.Expected = 'Running in the background'
+    if (-not $enabled) {
+        $runningRow.Status = 'Skip'
+        $runningRow.Actual = 'Command Palette is turned off in PowerToys'
+    } elseif (Get-Process -Name 'Microsoft.CmdPal.UI' -ErrorAction SilentlyContinue) {
+        $runningRow.Status = 'Pass'
+        $runningRow.Actual = 'Running'
+    } else {
+        Start-Process -FilePath 'explorer.exe' -ArgumentList 'x-cmdpal://background'
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while (-not (Get-Process -Name 'Microsoft.CmdPal.UI' -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+        }
+        if (Get-Process -Name 'Microsoft.CmdPal.UI' -ErrorAction SilentlyContinue) {
+            $runningRow.Status = 'Warn'
+            $runningRow.Actual = 'Started only when launched directly'
+            $runningRow.Message = "PowerToys didn't start it, but x-cmdpal://background did."
+        } else {
+            $runningRow.Actual = "Didn't start"
+            $runningRow.Message = 'Neither PowerToys nor x-cmdpal://background started Microsoft.CmdPal.UI.'
+        }
+    }
+    Add-VerifyResult -Result $runningRow
+
+    # Extensions are discovered through the com.microsoft.commandpalette app extension; PowerToys ships one in SparseApp.
+    $extensions = @(Get-VerifyCmdPalExtension)
+    $powerToysExtension = $extensions | Where-Object { $_.Package -eq 'Microsoft.PowerToys.SparseApp' } | Select-Object -First 1
+    $catalogRow = New-VerifyResult -Name 'CmdPalExtensions' -Title 'Command Palette extensions' -Kind 'Smoke'
+    $catalogRow.Expected = 'PowerToys extension registered'
+    if ($extensions.Count) {
+        $catalogRow.Probe = ($extensions | ForEach-Object { "$($_.Id) ($($_.Package))" }) -join ', '
+    }
+    if ($powerToysExtension) {
+        $catalogRow.Status = 'Pass'
+        $catalogRow.Actual = "$($extensions.Count) registered, including PowerToys"
+    } else {
+        $catalogRow.Actual = "PowerToys extension isn't registered"
+        $catalogRow.Message = 'It comes from Microsoft.PowerToys.SparseApp, which the PowerToys installer registers.'
+    }
+    Add-VerifyResult -Result $catalogRow
+    if (-not $powerToysExtension -or -not $powerToysExtension.ClassId) { return }
+
+    # Activate the extension's COM server the way Command Palette does, then stop any server this check started.
+    $serverRow = New-VerifyResult -Name 'CmdPalPowerToysExtension' -Title 'PowerToys extension starts' -Kind 'Smoke'
+    $serverRow.Expected = 'COM server activates'
+    $serverRow.Detail = $powerToysExtension.ClassId
+    $before = @(Get-Process -Name 'Microsoft.CmdPal.Ext.PowerToys' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    $probe = Invoke-VerifyComProbe -Method Activate -Clsid $powerToysExtension.ClassId
+    if ($probe.Ok) {
+        $serverRow.Status = 'Pass'
+        $serverRow.Actual = 'Activated with package identity'
+    } else {
+        $serverRow.Actual = "Didn't activate"
+        $serverRow.Message = "$($probe.Error)."
+    }
+    Start-Sleep -Milliseconds 500
+    foreach ($process in @(Get-Process -Name 'Microsoft.CmdPal.Ext.PowerToys' -ErrorAction SilentlyContinue)) {
+        if ($before -notcontains $process.Id) { Stop-Process -Id $process.Id -ErrorAction SilentlyContinue }
+    }
+    Add-VerifyResult -Result $serverRow
 }
 
 #endregion

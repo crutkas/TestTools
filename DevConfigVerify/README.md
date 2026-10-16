@@ -76,7 +76,20 @@ For each package it checks that:
 - Every executable and COM DLL its installed manifest declares is present.
 - For context menu packages, it activates each handler out of process, as Explorer does, and reads its menu title (for example, "Rename with PowerRename"). The command itself is never invoked.
 
-A context menu package whose module is turned off in PowerToys is reported as skipped, not failed, because PowerToys registers it only while the module is on. The script also reports whether PowerToys is running.
+A context menu package whose module is turned off in PowerToys is reported as skipped, not failed, because PowerToys registers it only while the module is on. New+ is off by default.
+
+If PowerToys isn't running, the script starts it and waits up to 90 seconds for enabled modules to register their packages and for Command Palette to launch. On a fresh install, the first start may open PowerToys' welcome window.
+
+### Command Palette
+
+| Check | How |
+| --- | --- |
+| Command Palette package | `Microsoft.CommandPalette` is registered with status `Ok`. PowerToys installs it from `WinUI3Apps\CmdPal` when the module is on. |
+| Command Palette is running | `Microsoft.CmdPal.UI` is running in the background. If PowerToys didn't start it, the script tries `x-cmdpal://background` itself and reports **set up differently** if that works. |
+| Command Palette extensions | Lists every installed package that declares the `com.microsoft.commandpalette` app extension, and requires the PowerToys one from `Microsoft.PowerToys.SparseApp`. |
+| PowerToys extension starts | Activates the PowerToys extension's COM server the way Command Palette does, which proves its sparse package identity works. Any server process the check started is stopped afterward. |
+
+If Command Palette is turned off in PowerToys, these checks are skipped.
 
 ## Coreutils smoke test
 
