@@ -28,8 +28,9 @@
   Point it at <clone>\src\windows-dev-config to verify a branch.
 
 .PARAMETER NoSmokeTests
-  Skips the PowerToys smoke test, which checks each sparse MSIX package PowerToys registers and
-  loads every Windows 11 context menu handler out of process to read its menu title.
+  Skips the smoke tests. The PowerToys test checks each sparse MSIX package PowerToys registers and
+  loads every Windows 11 context menu handler out of process to read its menu title. The Coreutils
+  test runs "ls -al" directly, through Command Prompt, and through Coreutils' PowerShell hook.
 
 .PARAMETER Baseline
   A previous report folder, for example one from a known-good machine. Its results and
@@ -70,7 +71,7 @@ try {
     Write-Verbose "Could not force UTF-8 console encoding: $($_.Exception.Message)"
 }
 
-$VerifyToolVersion = '1.3.0'
+$VerifyToolVersion = '1.4.0'
 
 if ($Workload -ne 'devconfig' -and -not $PSBoundParameters.ContainsKey('Experience')) {
     $Experience = 'Full'
@@ -457,6 +458,7 @@ function New-VerifyResult {
         Detail     = ''
         Message    = ''
         Probe      = ''
+        Output     = ''
         UpdateAvailable = $false
         BestEffort = $BestEffort
         Seconds    = 0
@@ -885,6 +887,155 @@ function Invoke-VerifyPowerToysSmokeTest {
             $failed.Message = $_.Exception.Message
             Add-VerifyResult -Result $failed
         }
+    }
+}
+
+#endregion
+
+#region Coreutils smoke test
+
+# Coreutils installs coreutils.exe plus bin\<tool>.exe hardlinks and cmd\<tool>.cmd shims, and puts its
+# folder ahead of System32 on PATH. PowerShell keeps ls as an alias for Get-ChildItem, so the installer
+# adds a profile hook that rewrites typed commands such as "ls -al" to the cmd\ shims.
+function Get-VerifyCoreutilsInstall {
+    $candidates = @(
+        foreach ($root in @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+                'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')) {
+            foreach ($key in Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue) {
+                $location = [string]$key.GetValue('InstallLocation')
+                if ($location -and [string]$key.GetValue('DisplayName') -match '(?i)coreutils') { $location }
+            }
+        }
+        Join-Path $env:ProgramFiles 'coreutils'
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ 'coreutils.exe') -PathType Leaf) }
+    $directory = $candidates | Select-Object -First 1
+    if (-not $directory) { return $null }
+    $directory = ([string]$directory).TrimEnd('\')
+    return [pscustomobject]@{
+        Directory = $directory
+        CmdDir    = Join-Path $directory 'cmd'
+    }
+}
+
+# A throwaway folder with a known file, so a listing can be recognized regardless of locale.
+function New-VerifyListingFixture {
+    $directory = Join-Path ([IO.Path]::GetTempPath()) ('devconfig-verify-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $directory 'subfolder') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $directory 'devconfig-verify.txt'), 'hello')
+    return $directory
+}
+
+# A Unix mode string (for example -rwxrwxrwx) starts each long-format line; Get-ChildItem's "-a---" doesn't match.
+function Invoke-VerifyListing {
+    param([string] $FilePath, [string[]] $Arguments)
+    $run = Invoke-DevConfigNativeCommand -FilePath $FilePath -Arguments $Arguments -TimeoutSeconds 60
+    $output = ([string]$run.Output).TrimEnd()
+    $line = $output -split '\r?\n' | Where-Object { $_ -match '^\s*[-dlcbps][-rwxsStT]{9}\S?\s+.*\bdevconfig-verify\.txt\s*$' } | Select-Object -First 1
+    return [pscustomobject]@{ ExitCode = $run.ExitCode; Output = $output; Line = $(if ($line) { $line.Trim() } else { '' }) }
+}
+
+function Set-VerifyListingResult {
+    param($Result, $Listing, [string] $PassText)
+    $Result.Output = $Listing.Output
+    if ($Listing.ExitCode -eq 0 -and $Listing.Line) {
+        $Result.Status = 'Pass'
+        $Result.Actual = $PassText
+        $Result.Probe = $Listing.Line
+    } else {
+        $Result.Status = 'Fail'
+        $first = @($Listing.Output -split '\r?\n' | Where-Object { $_.Trim() }) | Select-Object -First 1
+        $Result.Actual = if ($Listing.ExitCode -ne 0) { "Exited with $($Listing.ExitCode)" } else { "Output wasn't a long listing" }
+        if ($first) { $Result.Message = ([string]$first).Trim() }
+    }
+}
+
+function Invoke-VerifyCoreutilsSmokeTest {
+    $install = Get-VerifyCoreutilsInstall
+    if (-not $install) {
+        $skipped = New-VerifyResult -Name 'CoreutilsInstall' -Title 'Coreutils install' -Kind 'Smoke'
+        $skipped.Status = 'Skip'
+        $skipped.Expected = 'Coreutils installed'
+        $skipped.Actual = "Coreutils isn't installed"
+        Add-VerifyResult -Result $skipped
+        return
+    }
+
+    $fixture = New-VerifyListingFixture
+    try {
+        # The binary itself, as PATH resolves it.
+        $binary = New-VerifyResult -Name 'CoreutilsLs' -Title 'ls -al runs' -Kind 'Smoke'
+        $binary.Expected = 'Long listing from Coreutils'
+        $ls = Get-Command -Name ls -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $ls) {
+            $binary.Actual = "ls isn't on PATH"
+            $binary.Message = "Coreutils is installed at $($install.Directory), but its folder isn't on PATH."
+        } else {
+            $binary.Detail = $ls.Source
+            $version = Invoke-DevConfigNativeCommand -FilePath $ls.Source -Arguments @('--version') -TimeoutSeconds 30
+            $versionLine = @(([string]$version.Output) -split '\r?\n' | Where-Object { $_.Trim() }) | Select-Object -First 1
+            Set-VerifyListingResult -Result $binary -Listing (Invoke-VerifyListing -FilePath $ls.Source -Arguments @('-al', $fixture)) `
+                -PassText $(if ($versionLine) { ([string]$versionLine).Trim() } else { 'Listed the test folder' })
+            if ($binary.Status -eq 'Pass' -and -not ($ls.Source.StartsWith($install.Directory + '\', [StringComparison]::OrdinalIgnoreCase))) {
+                $binary.Status = 'Warn'
+                $binary.Message = "PATH finds ls outside Coreutils ($($install.Directory))."
+            }
+        }
+        Add-VerifyResult -Result $binary
+
+        # Command Prompt resolves ls through PATH with no aliases in the way.
+        $cmd = New-VerifyResult -Name 'CoreutilsCmd' -Title 'ls -al in Command Prompt' -Kind 'Smoke'
+        $cmd.Expected = 'Coreutils ls'
+        $cmdExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
+        $where = Invoke-DevConfigNativeCommand -FilePath $cmdExe -Arguments @('/d', '/c', 'where', 'ls') -TimeoutSeconds 30
+        $found = @(([string]$where.Output) -split '\r?\n' | Where-Object { $_.Trim() }) | Select-Object -First 1
+        if ($found) { $cmd.Detail = ([string]$found).Trim() }
+        Set-VerifyListingResult -Result $cmd -Listing (Invoke-VerifyListing -FilePath $cmdExe -Arguments @('/d', '/c', 'ls', '-al', $fixture)) `
+            -PassText 'Listed the test folder'
+        Add-VerifyResult -Result $cmd
+
+        # PowerShell: the profile hook must be loaded, list ls, and its ls.cmd shim must work.
+        $pwshRow = New-VerifyResult -Name 'CoreutilsPowerShell' -Title 'ls -al in PowerShell' -Kind 'Smoke'
+        $pwshRow.Expected = 'Typed ls -al runs Coreutils'
+        $pwsh = Get-Command -Name pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $pwsh) {
+            $pwshRow.Status = 'Skip'
+            $pwshRow.Actual = "PowerShell 7 isn't installed"
+        } else {
+            $probe = @'
+$fn = Get-Command -Name PSConsoleHostReadLine -CommandType Function -ErrorAction SilentlyContinue
+$set = Get-Variable -Name __COREUTILS__ -ValueOnly -ErrorAction SilentlyContinue
+$dir = if ($fn -and $fn.Definition -match "& '([^']+\\)") { $Matches[1] } else { '' }
+"VERIFY-HOOK=$([bool]($fn -and $fn.Definition -match '__COREUTILS'))"
+"VERIFY-LS=$([bool]($set -and $set.Contains('ls')))"
+"VERIFY-DIR=$dir"
+'@
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+            $run = Invoke-DevConfigNativeCommand -FilePath $pwsh.Source -Arguments @('-NoLogo', '-NonInteractive', '-EncodedCommand', $encoded) -TimeoutSeconds 60
+            $text = [string]$run.Output
+            $hook = $text -match 'VERIFY-HOOK=True'
+            $hasLs = $text -match 'VERIFY-LS=True'
+            $cmdDir = if ($text -match 'VERIFY-DIR=([^\r\n]+)') { $Matches[1].Trim() } else { $install.CmdDir + '\' }
+            if (-not $hook) {
+                $pwshRow.Status = 'Fail'
+                $pwshRow.Actual = "Not set up; ls is still Get-ChildItem"
+                $pwshRow.Message = "Coreutils' PowerShell profile hook isn't loaded, so typed ls -al fails. The installer adds it for PowerShell 7.4 or later."
+            } elseif (-not $hasLs) {
+                $pwshRow.Status = 'Warn'
+                $pwshRow.Actual = 'ls is turned off in Coreutils'
+                $pwshRow.Message = 'Turn it back on with: coreutils-manager enable ls'
+            } else {
+                # Run exactly what the hook rewrites "ls -al" into.
+                $shim = Join-Path $cmdDir 'ls.cmd'
+                $pwshRow.Detail = $shim
+                Set-VerifyListingResult -Result $pwshRow -Listing (Invoke-VerifyListing -FilePath $shim -Arguments @('--color=auto', '-al', $fixture)) `
+                    -PassText 'Profile hook rewrites it to Coreutils'
+            }
+        }
+        Add-VerifyResult -Result $pwshRow
+    } finally {
+        Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1450,6 +1601,9 @@ dialog{border:0;padding:0;background:transparent;max-width:96vw;max-height:96vh}
 dialog::backdrop{background:rgba(0,0,0,.72)}
 dialog img{display:block;max-width:96vw;max-height:96vh;border-radius:10px}
 footer{margin-top:64px;color:var(--muted);font-size:12px}
+details{margin-top:6px;color:var(--text)}
+details summary{cursor:pointer;color:var(--muted);font-size:12.5px}
+details pre{margin:6px 0 0;padding:10px 12px;background:var(--soft);border:1px solid var(--line);border-radius:8px;font:12px/1.5 ui-monospace,"Cascadia Mono",Consolas,monospace;overflow:auto;max-height:260px;white-space:pre}
 </style>
 </head>
 <body>
@@ -1508,6 +1662,9 @@ footer{margin-top:64px;color:var(--muted);font-size:12px}
             # Older results files predate the probe field.
             if ($row.PSObject.Properties['Probe'] -and $row.Probe) { [void]$html.Append("<div class=""sub""><code>$(& $e $row.Probe)</code></div>") }
             if ($row.Message) { [void]$html.Append("<div class=""sub"">$(& $e $row.Message)</div>") }
+            if ($row.PSObject.Properties['Output'] -and $row.Output) {
+                [void]$html.Append("<details><summary>Output</summary><pre>$(& $e $row.Output)</pre></details>")
+            }
             [void]$html.Append('</td>')
             if ($hasBaseline) {
                 if ($base) {
@@ -1607,14 +1764,20 @@ foreach ($phase in $phases) {
 }
 
 $panels = @()
-if (-not $NoSmokeTests -and @($Script:VerifyResults | Where-Object { $_.Name -eq 'PowerToys' }).Count -gt 0) {
-    $Script:DevConfigPhaseTitle = 'PowerToys smoke test'
+# Each smoke test runs when its package is part of the workload being verified.
+$smokeTests = @(
+    @{ Package = 'PowerToys'; Title = 'PowerToys smoke test'; Run = { Invoke-VerifyPowerToysSmokeTest } }
+    @{ Package = 'Coreutils'; Title = 'Coreutils smoke test'; Run = { Invoke-VerifyCoreutilsSmokeTest } }
+)
+foreach ($smokeTest in $smokeTests) {
+    if ($NoSmokeTests -or @($Script:VerifyResults | Where-Object { $_.Name -eq $smokeTest.Package }).Count -eq 0) { continue }
+    $Script:DevConfigPhaseTitle = $smokeTest.Title
     Write-Host ''
-    Write-Host 'PowerToys smoke test' -ForegroundColor Cyan
+    Write-Host $smokeTest.Title -ForegroundColor Cyan
     try {
-        Invoke-VerifyPowerToysSmokeTest
+        & $smokeTest.Run
     } catch {
-        $failed = New-VerifyResult -Name 'PowerToysSmokeTest' -Title 'PowerToys smoke test'
+        $failed = New-VerifyResult -Name "$($smokeTest.Package)SmokeTest" -Title $smokeTest.Title
         $failed.Status = 'Error'
         $failed.Actual = "Couldn't check"
         $failed.Message = $_.Exception.Message

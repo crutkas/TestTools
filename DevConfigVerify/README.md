@@ -27,7 +27,7 @@ If execution policy blocks the script, start it with `pwsh -ExecutionPolicy Bypa
 | `-Baseline` | none | Earlier report folder to show side by side with this run. |
 | `-OutputPath` | `%USERPROFILE%\DevConfigReports\<experience>-<timestamp>` | Report folder. |
 | `-NoScreenshots` | off | Run only the checks. |
-| `-NoSmokeTests` | off | Skip the PowerToys smoke test. |
+| `-NoSmokeTests` | off | Skip the PowerToys and Coreutils smoke tests. |
 | `-NoOpen` | off | Don't open the report when finished. |
 
 It exits with `0` when nothing failed and `1` otherwise, so it also works in automation.
@@ -77,6 +77,18 @@ For each package it checks that:
 - For context menu packages, it activates each handler out of process, as Explorer does, and reads its menu title (for example, "Rename with PowerRename"). The command itself is never invoked.
 
 A context menu package whose module is turned off in PowerToys is reported as skipped, not failed, because PowerToys registers it only while the module is on. The script also reports whether PowerToys is running.
+
+## Coreutils smoke test
+
+When the workload includes Coreutils, the script runs `ls -al` against a throwaway folder in three ways and expects a real long listing: a Unix mode string such as `-rwxrwxrwx` next to a known test file.
+
+| Check | How |
+| --- | --- |
+| `ls -al runs` | Runs `ls` as PATH resolves it, reports its `--version`, and warns if PATH finds an `ls` outside Coreutils. |
+| `ls -al in Command Prompt` | Runs `cmd /c ls -al`, which is how CMD users reach Coreutils, and records what `where ls` finds. |
+| `ls -al in PowerShell` | PowerShell keeps `ls` as an alias for `Get-ChildItem`, so Coreutils adds a profile hook that rewrites typed commands. The script confirms the hook loads in `pwsh` and covers `ls`, then runs the exact command the hook produces (`cmd\ls.cmd --color=auto -al`). |
+
+Each listing is included in the report under **Output**. The test folder is deleted afterward.
 
 Output folder:
 
