@@ -23,7 +23,8 @@ If execution policy blocks the script, start it with `pwsh -ExecutionPolicy Bypa
 | --- | --- | --- |
 | `-Experience` | `Standard` | `Standard` (setup's `-Action Partial`) or `Full`. |
 | `-Workload` | `devconfig` | Verify a single workload instead, such as `winui`. |
-| `-ConfigRoot` | `%ProgramData%\CalmOS`, then `.\windows-dev-config` | Where `dev-config.ps1`, `steps\`, and `workloads\` live. Point it at `<clone>\src\windows-dev-config` to verify against a branch. |
+| `-ConfigRoot` | Found automatically | Folder holding setup's `dev-config.ps1`, `steps\`, and `workloads\`. See [Where the setup definitions come from](#where-the-setup-definitions-come-from). |
+| `-Ref` | none | Download the definitions from this commit, branch, or tag of `microsoft/WindowsDeveloperConfig`. |
 | `-Baseline` | none | Earlier report folder to show side by side with this run. |
 | `-OutputPath` | `%USERPROFILE%\DevConfigReports\<experience>-<timestamp>` | Report folder. |
 | `-NoScreenshots` | off | Run only the checks. |
@@ -118,8 +119,16 @@ Screenshots capture whatever those windows show. That includes the signed-in acc
 ## Requirements
 
 - Windows 11, with Windows PowerShell 5.1 or PowerShell 7. PowerShell 7 also reports package versions through the WinGet module.
-- A Windows Dev Config install, or a clone of the repository (pass it with `-ConfigRoot`).
+- Internet access the first time on a machine without a Windows Dev Config install. After that the downloaded definitions are cached.
 
-## Running on a machine set up another way
+## Where the setup definitions come from
 
-If there's no `%ProgramData%\CalmOS`, put a `windows-dev-config` folder next to the script. It needs `dev-config.ps1`, `steps\`, and `workloads\`, copied from `src\windows-dev-config` in a WindowsDeveloperConfig clone. The script picks that folder up automatically, so you can zip the result and run it anywhere.
+The script needs setup's own definitions (`dev-config.ps1`, `steps\`, and `workloads\`), so it finds them itself. The first match wins:
+
+1. The folder passed with `-ConfigRoot`, for example `<clone>\src\windows-dev-config` to check a branch.
+2. The release named by `-Ref`, such as a commit, `main`, or a tag.
+3. The copy setup installed to `%ProgramData%\CalmOS`, which is exactly what ran on this machine.
+4. A `windows-dev-config` folder next to the script.
+5. The release the setup one-liner installs today. The script reads the payload commit pinned by `setup-standard.ps1`, `setup-full.ps1`, or the workload's wrapper on `main`, and downloads that commit.
+
+Downloads come from `microsoft/WindowsDeveloperConfig` and use only the released `windows-dev-config` folder. Every `.ps1` in it must carry a valid Microsoft signature, as bootstrap requires, or nothing from the download runs. Copies are cached in `%LOCALAPPDATA%\DevConfigVerify\definitions` and re-checked on every use. Offline, the newest cached copy is used with a warning. The report header shows which source was used.

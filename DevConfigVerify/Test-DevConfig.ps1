@@ -23,9 +23,15 @@
   Workload definition to verify. Workloads other than devconfig only support Full.
 
 .PARAMETER ConfigRoot
-  Folder containing dev-config.ps1, steps\, and workloads\. Defaults to the copy that bootstrap
-  installs to %ProgramData%\CalmOS, then to a windows-dev-config folder next to this script.
-  Point it at <clone>\src\windows-dev-config to verify a branch.
+  Folder containing dev-config.ps1, steps\, and workloads\. Point it at
+  <clone>\src\windows-dev-config to verify a branch. When omitted, the script uses the copy setup
+  installed to %ProgramData%\CalmOS, then a windows-dev-config folder next to this script, and
+  otherwise downloads the release the setup one-liner installs today. Downloads must be
+  Microsoft-signed and are cached in %LOCALAPPDATA%\DevConfigVerify.
+
+.PARAMETER Ref
+  Downloads the definitions from this commit, branch, or tag of microsoft/WindowsDeveloperConfig
+  instead of looking for a local copy.
 
 .PARAMETER NoSmokeTests
   Skips the smoke tests. The PowerToys test starts PowerToys if needed, checks each sparse MSIX
@@ -51,6 +57,7 @@ param(
     [ValidateSet('Standard', 'Full')] [string] $Experience = 'Standard',
     [ValidatePattern('^[a-z0-9]+(-[a-z0-9]+)*$')] [string] $Workload = 'devconfig',
     [string] $ConfigRoot = (Join-Path $env:ProgramData 'CalmOS'),
+    [string] $Ref,
     [string] $OutputPath,
     [string] $Baseline,
     [switch] $NoScreenshots,
@@ -72,25 +79,131 @@ try {
     Write-Verbose "Could not force UTF-8 console encoding: $($_.Exception.Message)"
 }
 
-$VerifyToolVersion = '1.5.1'
+$VerifyToolVersion = '1.6.0'
 
 if ($Workload -ne 'devconfig' -and -not $PSBoundParameters.ContainsKey('Experience')) {
     $Experience = 'Full'
 }
 $Action = if ($Experience -eq 'Full') { 'Full' } else { 'Partial' }
 
-# Machines set up some other way have no installed copy; a copy bundled next to this script is used instead.
-if (-not $PSBoundParameters.ContainsKey('ConfigRoot') -and -not (Test-Path -LiteralPath (Join-Path $ConfigRoot 'dev-config.ps1') -PathType Leaf)) {
-    $bundled = Join-Path $PSScriptRoot 'windows-dev-config'
-    if (Test-Path -LiteralPath (Join-Path $bundled 'dev-config.ps1') -PathType Leaf) {
-        $ConfigRoot = $bundled
+#region Find the setup definitions
+
+$Script:VerifyRepository = 'microsoft/WindowsDeveloperConfig'
+$Script:VerifyMicrosoftSubject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US'
+$Script:VerifyCacheRoot = Join-Path $env:LOCALAPPDATA 'DevConfigVerify\definitions'
+# Windows PowerShell 5.1 doesn't offer TLS 1.2 by default, which GitHub requires.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+function Test-VerifyDefinitionFolder {
+    param([string] $Path)
+    return [bool]$Path -and (Test-Path -LiteralPath (Join-Path $Path 'dev-config.ps1') -PathType Leaf)
+}
+
+# Downloaded definitions run inside this script, so every .ps1 must carry Microsoft's signature, as bootstrap requires.
+function Assert-VerifyMicrosoftSigned {
+    param([string] $Path)
+    $bad = @(Get-ChildItem -LiteralPath $Path -Filter '*.ps1' -File -Recurse | Where-Object {
+            $signature = Get-AuthenticodeSignature -FilePath $_.FullName
+            $signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
+                $signature.SignerCertificate.Subject -ne $Script:VerifyMicrosoftSubject
+        } | ForEach-Object { $_.FullName.Substring($Path.Length).TrimStart('\') })
+    if ($bad.Count) {
+        throw "These downloaded setup files aren't Microsoft-signed, so none were used: $($bad -join ', ')."
     }
 }
 
-if (-not (Test-Path -LiteralPath (Join-Path $ConfigRoot 'dev-config.ps1') -PathType Leaf)) {
-    throw "No Windows Dev Config found at '$ConfigRoot'. Setup installs it to %ProgramData%\CalmOS; otherwise put a windows-dev-config folder next to this script or pass -ConfigRoot <clone>\src\windows-dev-config."
+# The setup one-liners run a wrapper on main that pins the payload commit, so this finds the same release.
+function Get-VerifyPayloadRef {
+    $wrapper = if ($Workload -ne 'devconfig') {
+        "Workloads/$Workload/setup.ps1"
+    } elseif ($Experience -eq 'Full') {
+        'windows-dev-config/setup-full.ps1'
+    } else {
+        'windows-dev-config/setup-standard.ps1'
+    }
+    $text = [string](Invoke-RestMethod -Uri "https://raw.githubusercontent.com/$Script:VerifyRepository/main/$wrapper" -UseBasicParsing -TimeoutSec 60)
+    $match = [regex]::Match($text, '\$payloadRef\s*=\s*''([0-9a-f]{40})''')
+    if (-not $match.Success) {
+        throw "$wrapper on main doesn't pin a payload commit. Pass -Ref to choose one."
+    }
+    return $match.Groups[1].Value
+}
+
+# Downloads the released, signed windows-dev-config folder at a ref into a per-ref cache.
+function Install-VerifyDefinitions {
+    param([string] $Ref)
+    $target = Join-Path $Script:VerifyCacheRoot ($Ref -replace '[^\w.-]', '_')
+    # A commit never changes, so its cached copy is reused; branches and tags are downloaded again.
+    if ($Ref -match '^[0-9a-f]{40}$' -and (Test-VerifyDefinitionFolder -Path $target)) {
+        Assert-VerifyMicrosoftSigned -Path $target
+        return $target
+    }
+
+    Write-Host "Downloading the setup definitions ($Script:VerifyRepository@$($Ref.Substring(0, [Math]::Min(12, $Ref.Length))))..." -ForegroundColor DarkGray
+    $work = Join-Path ([IO.Path]::GetTempPath()) ('devconfig-verify-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $previousProgress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        $zip = Join-Path $work 'source.zip'
+        Invoke-WebRequest -Uri "https://github.com/$Script:VerifyRepository/archive/$Ref.zip" -OutFile $zip -UseBasicParsing -TimeoutSec 300
+        $expanded = Join-Path $work 'expanded'
+        Expand-Archive -LiteralPath $zip -DestinationPath $expanded -Force
+        $root = Get-ChildItem -LiteralPath $expanded -Directory | Select-Object -First 1
+        $released = if ($root) { Join-Path $root.FullName 'windows-dev-config' } else { '' }
+        if (-not (Test-VerifyDefinitionFolder -Path $released)) {
+            throw "$Script:VerifyRepository@$Ref has no windows-dev-config\dev-config.ps1."
+        }
+        Assert-VerifyMicrosoftSigned -Path $released
+
+        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        Copy-Item -Path (Join-Path $released '*') -Destination $target -Recurse -Force
+        return $target
+    } finally {
+        $ProgressPreference = $previousProgress
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Order: an explicit -ConfigRoot, an explicit -Ref, the installed copy, a copy next to this script, then a download.
+$ConfigSource = ''
+if ($PSBoundParameters.ContainsKey('ConfigRoot')) {
+    $ConfigSource = 'Folder passed with -ConfigRoot'
+} elseif ($Ref) {
+    $ConfigRoot = Install-VerifyDefinitions -Ref $Ref
+    $ConfigSource = "Downloaded $Script:VerifyRepository@$Ref"
+} elseif (Test-VerifyDefinitionFolder -Path $ConfigRoot) {
+    $ConfigSource = 'Installed by setup'
+} elseif (Test-VerifyDefinitionFolder -Path (Join-Path $PSScriptRoot 'windows-dev-config')) {
+    $ConfigRoot = Join-Path $PSScriptRoot 'windows-dev-config'
+    $ConfigSource = 'Copy next to this script'
+} else {
+    try {
+        $payloadRef = Get-VerifyPayloadRef
+        $ConfigRoot = Install-VerifyDefinitions -Ref $payloadRef
+        $ConfigSource = "$Script:VerifyRepository@$($payloadRef.Substring(0, 7)), the release setup installs today"
+    } catch {
+        $downloadError = $_.Exception.Message
+        # Offline, fall back to the newest signed copy downloaded earlier.
+        $cached = Get-ChildItem -LiteralPath $Script:VerifyCacheRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-VerifyDefinitionFolder -Path $_.FullName } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $cached) {
+            throw "No Windows Dev Config is installed here, and downloading it failed: $downloadError Connect to the internet, or pass -ConfigRoot <clone>\src\windows-dev-config."
+        }
+        Assert-VerifyMicrosoftSigned -Path $cached.FullName
+        Write-Host "  Couldn't download the setup definitions ($downloadError); using a copy from $($cached.LastWriteTime)." -ForegroundColor Yellow
+        $ConfigRoot = $cached.FullName
+        $ConfigSource = "Cached $Script:VerifyRepository@$($cached.Name.Substring(0, [Math]::Min(7, $cached.Name.Length))) (offline)"
+    }
+}
+
+if (-not (Test-VerifyDefinitionFolder -Path $ConfigRoot)) {
+    throw "No Windows Dev Config found at '$ConfigRoot'. Pass a folder that contains dev-config.ps1, steps\, and workloads\, such as <clone>\src\windows-dev-config."
 }
 $ConfigRoot = (Resolve-Path -LiteralPath $ConfigRoot).ProviderPath.TrimEnd('\')
+
+#endregion
 
 $BaselineReport = $null
 if ($Baseline) {
@@ -1817,7 +1930,9 @@ details pre{margin:6px 0 0;padding:10px 12px;background:var(--soft);border:1px s
     $signed = if ($Report.ConfigSigned) { 'Microsoft-signed' } else { 'unsigned source' }
     [void]$html.Append("<header><h1>Dev Config verification</h1><div class=""meta"">")
     [void]$html.Append("$(& $e $Report.Experience) experience &middot; $(& $e $Report.Workload) workload &middot; $(& $e $Report.Computer) &middot; $(& $e $Report.Os) &middot; PowerShell $(& $e $Report.PowerShell)<br>")
-    [void]$html.Append("$(& $e (([datetime]$Report.Generated).ToString('f'))) &middot; Definitions: <code>$(& $e $Report.ConfigRoot)</code> ($signed)")
+    # Older results files have no ConfigSource.
+    $source = if ($Report.Contains('ConfigSource') -and $Report.ConfigSource) { "$(& $e $Report.ConfigSource), " } else { '' }
+    [void]$html.Append("$(& $e (([datetime]$Report.Generated).ToString('f'))) &middot; Definitions: $source<code>$(& $e $Report.ConfigRoot)</code> ($signed)")
     if ($hasBaseline) {
         # ConvertFrom-Json may already have turned the timestamp into a DateTime; the cast accepts both.
         [void]$html.Append("<br>Baseline: $(& $e $BaselineReport.Computer) &middot; $(& $e $BaselineReport.Os) &middot; $(& $e (([datetime]$BaselineReport.Generated).ToString('f')))")
@@ -1940,7 +2055,8 @@ $Script:DevConfigAllowUnsigned = $true
 
 Write-Host ''
 Write-Host "Verifying $($definition['Name']) ($Experience experience, -Action $Action)" -ForegroundColor Cyan
-Write-Host "  Definitions: $ConfigRoot" -ForegroundColor DarkGray
+Write-Host "  Definitions: $ConfigSource" -ForegroundColor DarkGray
+Write-Host "  $ConfigRoot" -ForegroundColor DarkGray
 if ($isElevated) {
     Write-Host '  Running elevated: per-user checks read the elevated account. Run unelevated as the user who ran setup.' -ForegroundColor Yellow
 }
@@ -2022,6 +2138,7 @@ $report = [ordered]@{
     Action       = $Action
     Workload     = $Workload
     ConfigRoot   = $ConfigRoot
+    ConfigSource = $ConfigSource
     ConfigSigned = ($signature.Status -eq 'Valid' -and $signature.SignerCertificate -and $signature.SignerCertificate.Subject -match 'O=Microsoft Corporation')
     Summary      = $summary
     Results      = $results
