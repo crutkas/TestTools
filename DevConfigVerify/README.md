@@ -2,6 +2,8 @@
 
 Checks that a [Windows Dev Config](https://github.com/microsoft/WindowsDeveloperConfig) setup actually landed. It confirms that every package and setting is in place, then writes an HTML report with screenshots of the related Settings pages so you can see the result.
 
+Two companion scripts go further and run real work with each tool: one without signing in, one with. See [End-to-end scenarios](#end-to-end-scenarios).
+
 ## Run it
 
 Double-click `Run.cmd`, or run it from a terminal. Run it as the same user who ran setup, and don't run it elevated.
@@ -112,14 +114,111 @@ results.json     machine-readable results, also what -Baseline reads
 screenshots\     the PNGs
 ```
 
+## End-to-end scenarios
+
+`Test-DevConfig.ps1` confirms that everything is in place. These two scripts confirm that the tools do real work. Run them after setup, after `Test-DevConfig.ps1`.
+
+| Script | Launcher | Signs in |
+| --- | --- | --- |
+| `Test-DevScenarios.ps1` | `Run-Scenarios.cmd` | No |
+| `Test-DevScenariosAuth.ps1` | `Run-ScenariosAuth.cmd` | Yes: GitHub CLI, GitHub Copilot CLI, and Azure CLI |
+
+Both use `DevScenarios.Common.ps1`, so keep the folder together. Run them as the user who ran setup, and don't run them elevated. Each writes `report.html` and `results.json` to `%USERPROFILE%\DevConfigReports\scenarios-<timestamp>` (or `scenarios-auth-<timestamp>`), and exits with `0` when nothing failed and `1` otherwise.
+
+### Without signing in
+
+```powershell
+# Everything, in all three shells
+.\Test-DevScenarios.ps1
+
+# Quicker: PowerShell 7 only, without nvm switching or WSL
+.\Test-DevScenarios.ps1 -Shell pwsh -Skip Nvm,Wsl
+
+# One group
+.\Test-DevScenarios.ps1 -Only Wsl
+```
+
+Command-line scenarios run in a new PowerShell 7, Windows PowerShell 5.1, and Command Prompt process, and the report shows one column per shell. Each process gets the environment Windows gives a newly opened terminal. Its PATH and variables come from the registry, not from the window you started the script in. Profiles and AutoRun commands load, and the machine's own execution policy applies. A stale PATH, a blocked `npm.ps1`, or a broken profile fails here the same way it would for you.
+
+| Group | Scenarios |
+| --- | --- |
+| Shells | Each shell starts without errors from its profile or AutoRun. |
+| Python | `python` and `py` run an installed Python, not the Microsoft Store alias. A virtual environment activates, `pip` installs `requests`, and the import works. `numpy` installs and runs, and `msvcp140.dll` from the Visual C++ runtime loads. |
+| uv | `uv init`, `uv add httpx`, then `uv run` a script that imports it. |
+| Node.js | `npm init`, `npm install lodash`, `node` uses it, and `npx` runs `semver`. |
+| nvm | Installs another Node.js LTS, switches to it with `nvm use`, and checks `node --version` in a new window. Then it restores the previous selection and removes the version it added. It warns when Windows asked for administrator approval, or when PATH still finds the Node.js LTS install first. |
+| .NET | `dotnet new console`, then build and run. `dotnet new` lists the WinUI templates. |
+| Git | Init, commit, branch, and merge. Clones `github.com/octocat/Hello-World` over HTTPS. |
+| VS Code | `code` installs EditorConfig into a throwaway extensions folder, so your own extensions aren't touched. |
+| Oh My Posh | Renders a prompt, and a new PowerShell 7 starts it from the profile. |
+| Windows Terminal | `wt -w new` opens a window running PowerShell 7, the default profile. The window is closed afterward. |
+| Intelligent Terminal | Opens from its Start menu entry, then closes. This is a launch check only. |
+| winapp | Generates a manifest for a small program, then packs it into a signed MSIX with a generated development certificate. |
+| Azure CLI, GitHub CLI | `az version` and `gh --version`. The signed-in checks are in the other script. |
+| Copilot CLI | `copilot` runs, the `winui` plugin is installed, and `winui-*` skills are listed. |
+| WSL | Ubuntu is registered and runs `uname`. It reads a Windows file through `/mnt`, starts `cmd.exe` through interop, resolves `github.com`, and reaches it over HTTPS. |
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `-Shell` | `pwsh,powershell,cmd` | Shells to run the command-line scenarios in. |
+| `-Only` | all | Run only these groups: `Shells`, `Python`, `Uv`, `Node`, `Nvm`, `DotNet`, `Git`, `VSCode`, `OhMyPosh`, `Terminal`, `IntelligentTerminal`, `WinApp`, `AzureCli`, `GitHubCli`, `Copilot`, `Wsl`. |
+| `-Skip` | none | Groups to leave out. Same names as `-Only`. |
+| `-Distribution` | `Ubuntu` | WSL distribution to test. |
+| `-OutputPath` | `%USERPROFILE%\DevConfigReports\scenarios-<timestamp>` | Report folder. |
+| `-KeepWorkspace` | off | Keep the temporary folder with each scenario's files. |
+| `-NoOpen` | off | Don't open the report when finished. |
+
+Each scenario works in its own folder under `%TEMP%\DevScenarios-<timestamp>`, which is deleted at the end. Package caches remain: pip, npm, uv, NuGet, and the Windows SDK build tools winapp downloads. The nvm scenario puts nvm back the way it found it. A full run takes several minutes, mostly package downloads and three .NET builds.
+
+### Signed in
+
+```powershell
+# Sign in where needed, then run everything
+.\Test-DevScenariosAuth.ps1
+
+# Only Copilot: sign-in, a short prompt, and a WinUI skill
+.\Test-DevScenariosAuth.ps1 -Only Copilot
+
+# Choose the private repository to clone
+.\Test-DevScenariosAuth.ps1 -PrivateRepo contoso/private-repo
+```
+
+It starts by checking GitHub CLI, GitHub Copilot CLI, and Azure CLI. A tool that isn't signed in is signed in right there, in the same window, with `gh auth login --web`, `copilot login`, and `az login`. A tool that was already signed in gets a warning with the account it used, because this run didn't test its sign-in. To test signing in, sign out first and run again.
+
+| Group | Scenarios |
+| --- | --- |
+| Sign-in | GitHub CLI, Copilot CLI, and Azure CLI: signed in by this run, or already signed in (warning). |
+| GitHub CLI | `gh auth status`, `gh api user`, and `gh repo view`. |
+| Git + Credential Manager | Clones a private repository over HTTPS: by default the first one `gh repo list` returns, or `-PrivateRepo`. Git Credential Manager may open a sign-in window. It warns when Git Credential Manager already had a GitHub account, or when a different credential helper answered. |
+| Copilot CLI | One prompt that must reply `PONG`. One prompt that loads a `winui-*` skill (`winui-design` when available) with only the skill tool offered, and must answer. Each prompt uses a premium request. Without WinUI skills, no prompt is sent. |
+| Azure CLI | `az account show`, an access token's expiry (the token itself is never printed or saved), and a read-only `az rest` call that lists subscriptions. Nothing is created. |
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `-PrivateRepo` | First private repository `gh repo list` returns | Private repository (`owner/name`) to clone. |
+| `-Only` | all | Run only these groups: `GitHub`, `Git`, `Copilot`, `Azure`. |
+| `-Skip` | none | Groups to leave out, including their sign-in. |
+| `-OutputPath` | `%USERPROFILE%\DevConfigReports\scenarios-auth-<timestamp>` | Report folder. |
+| `-NoOpen` | off | Don't open the report when finished. |
+
+### After uninstall
+
+Run uninstall, then all three scripts. Nearly everything should fail; a pass means something was left behind. These are expected to pass or warn, because uninstall keeps them or they're part of Windows:
+
+- Windows PowerShell 5.1 and Command Prompt still start. PowerShell 7 columns are skipped once PowerShell 7 is gone.
+- Windows Terminal still opens. It should warn, because its default profile is no longer PowerShell 7.
+
+Uninstall also deletes Ubuntu, so the WSL scenarios fail even though the WSL feature stays.
+
 ## Privacy
 
-Screenshots capture whatever those windows show. That includes the signed-in account in Settings and recent files in File Explorer. Review a report before you share it, and don't commit report folders.
+Screenshots capture whatever those windows show. That includes the signed-in account in Settings and recent files in File Explorer. The signed-in scenarios report names your GitHub and Azure accounts, your Azure subscription, and the private repository it cloned. Review a report before you share it, and don't commit report folders.
 
 ## Requirements
 
 - Windows 11, with Windows PowerShell 5.1 or PowerShell 7. PowerShell 7 also reports package versions through the WinGet module.
 - Internet access the first time on a machine without a Windows Dev Config install. After that the downloaded definitions are cached.
+- For the scenario scripts: internet access to PyPI, npm, NuGet, the VS Code Marketplace, nodejs.org, and GitHub. The signed-in scenarios also need a browser for sign-in, and two Copilot premium requests.
 
 ## Where the setup definitions come from
 
