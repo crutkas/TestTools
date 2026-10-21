@@ -142,13 +142,14 @@ Command-line scenarios run in a new PowerShell 7, Windows PowerShell 5.1, and Co
 
 | Group | Scenarios |
 | --- | --- |
-| Shells | Each shell starts without errors from its profile or AutoRun. |
+| Shells | Each shell starts without errors from its profile or AutoRun. A new terminal's PATH has no entries left as unexpanded variables, such as `%NVM_HOME%`. |
 | Python | `python` and `py` run an installed Python, not the Microsoft Store alias. A virtual environment activates, `pip` installs `requests`, and the import works. `numpy` installs and runs, and `msvcp140.dll` from the Visual C++ runtime loads. |
 | uv | `uv init`, `uv add httpx`, then `uv run` a script that imports it. |
 | Node.js | `npm init`, `npm install lodash`, `node` uses it, and `npx` runs `semver`. |
 | nvm | Installs another Node.js LTS, switches to it with `nvm use`, and checks `node --version` in a new window. Then it restores the previous selection and removes the version it added. It warns when Windows asked for administrator approval, or when PATH still finds the Node.js LTS install first. |
-| .NET | `dotnet new console`, then build and run. `dotnet new` lists the WinUI templates. |
+| .NET | `dotnet new console`, then build and run. With `-Experience Full`, `dotnet new` also lists the WinUI templates, which only Full installs. |
 | Git | Init, commit, branch, and merge. Clones `github.com/octocat/Hello-World` over HTTPS. |
+| Coreutils | Every utility Coreutils for Windows ships gets its own check with known input and output, from `arch` to `xargs`, including the hash tools against reference digests. Pipelines too: `seq \| sort \| head`, a byte-exact `cat \| od`, `find -print0 \| xargs -0`, and `yes \| head`. First it confirms Coreutils' `bin` folder comes before Windows' `find`, `sort`, and `hostname` on PATH. Command Prompt runs its own `echo`, `date`, `mkdir`, and `rmdir`, so those are called as `"echo.exe"` there. PowerShell aliases shadow names like `cat` and `ls`, so PowerShell calls `<name>.exe`. Utilities turned off with `coreutils-manager` are skipped, and a utility without a check yet is flagged. |
 | VS Code | `code` installs EditorConfig into a throwaway extensions folder, so your own extensions aren't touched. |
 | Oh My Posh | Renders a prompt, and a new PowerShell 7 starts it from the profile. |
 | Windows Terminal | `wt -w new` opens a window running PowerShell 7, the default profile. The window is closed afterward. |
@@ -161,7 +162,8 @@ Command-line scenarios run in a new PowerShell 7, Windows PowerShell 5.1, and Co
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `-Shell` | `pwsh,powershell,cmd` | Shells to run the command-line scenarios in. |
-| `-Only` | all | Run only these groups: `Shells`, `Python`, `Uv`, `Node`, `Nvm`, `DotNet`, `Git`, `VSCode`, `OhMyPosh`, `Terminal`, `IntelligentTerminal`, `WinApp`, `AzureCli`, `GitHubCli`, `Copilot`, `Wsl`. |
+| `-Experience` | `Standard` | `Standard` or `Full`. Checks for what only Full installs are skipped for Standard. |
+| `-Only` | all | Run only these groups: `Shells`, `Python`, `Uv`, `Node`, `Nvm`, `DotNet`, `Git`, `Coreutils`, `VSCode`, `OhMyPosh`, `Terminal`, `IntelligentTerminal`, `WinApp`, `AzureCli`, `GitHubCli`, `Copilot`, `Wsl`. |
 | `-Skip` | none | Groups to leave out. Same names as `-Only`. |
 | `-Distribution` | `Ubuntu` | WSL distribution to test. |
 | `-OutputPath` | `%USERPROFILE%\DevConfigReports\scenarios-<timestamp>` | Report folder. |
@@ -169,6 +171,15 @@ Command-line scenarios run in a new PowerShell 7, Windows PowerShell 5.1, and Co
 | `-NoOpen` | off | Don't open the report when finished. |
 
 Each scenario works in its own folder under `%TEMP%\DevScenarios-<timestamp>`, which is deleted at the end. Package caches remain: pip, npm, uv, NuGet, and the Windows SDK build tools winapp downloads. The nvm scenario puts nvm back the way it found it. A full run takes several minutes, mostly package downloads and three .NET builds.
+
+Some Coreutils checks hit known platform behavior rather than a broken install. Those show as warnings that explain the cause:
+
+| Check | Where | Why |
+| --- | --- | --- |
+| `find \| xargs` | All shells | `find` prints paths like `.\fruits.txt`, and `xargs` reads `\` as an escape character. `find -print0 \| xargs -0` works. |
+| `find -name "*.txt"` | PowerShell | PowerShell drops the quotes when it starts a program, so Coreutils expands the wildcard itself. At an interactive prompt, the Coreutils integration keeps the quotes. |
+| `cat \| od`, `find -print0 \| xargs -0` | Windows PowerShell 5.1 | 5.1 passes text, not bytes, between programs. PowerShell 7.4 and later keep the bytes. |
+| `yes \| head` | PowerShell | PowerShell 7 reports "The pipe is being closed" although the output is right. In Windows PowerShell 5.1 the pipeline never ends, so it's stopped after 30 seconds. |
 
 ### Signed in
 

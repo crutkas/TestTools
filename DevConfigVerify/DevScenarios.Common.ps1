@@ -352,8 +352,9 @@ function Get-ScenarioStepText {
 }
 
 # One script per scenario and shell. Markers around each step let the transcript be split back into steps.
+# -ContinueOnFailure runs every step even after one fails, for scenarios that report each step separately.
 function New-ScenarioShellScript {
-    param([string] $Shell, [object[]] $Steps, [string] $WorkingDirectory)
+    param([string] $Shell, [object[]] $Steps, [string] $WorkingDirectory, [switch] $ContinueOnFailure)
     $lines = [System.Collections.Generic.List[string]]::new()
     if ($Shell -eq 'cmd') {
         $lines.Add('@echo off')
@@ -367,7 +368,7 @@ function New-ScenarioShellScript {
             $lines.Add("call $text")
             $lines.Add('set DEVSCN_RC=%ERRORLEVEL%')
             $lines.Add("echo ##DEVSCN-EXIT $i %DEVSCN_RC%##")
-            $lines.Add('if not "%DEVSCN_RC%"=="0" goto :devscn_end')
+            if (-not $ContinueOnFailure) { $lines.Add('if not "%DEVSCN_RC%"=="0" goto :devscn_end') }
         }
         $lines.Add(':devscn_end')
         $lines.Add('exit /b %DEVSCN_RC%')
@@ -386,7 +387,7 @@ function New-ScenarioShellScript {
             $lines.Add("try { $text; `$devscnOk = `$? } catch { `$devscnOk = `$false; Write-Output (`$_ | Out-String) }")
             $lines.Add('$devscnRc = if ($global:LASTEXITCODE -ne -424242) { [int]$global:LASTEXITCODE } elseif ($devscnOk) { 0 } else { 1 }')
             $lines.Add("Write-Output `"##DEVSCN-EXIT $i `$devscnRc##`"")
-            $lines.Add('if ($devscnRc -ne 0) { return }')
+            if (-not $ContinueOnFailure) { $lines.Add('if ($devscnRc -ne 0) { return }') }
         }
         $lines.Add('}')
     }
@@ -460,6 +461,131 @@ function Get-ScenarioFailureReason {
     return $pick
 }
 
+# Writes the steps into a script for the shell and runs it in a new process of that shell. Returns the raw
+# run, its transcript split back into steps, and the output without markers; or Missing when the shell isn't there.
+function Start-ScenarioShellRun {
+    param([string] $Shell, [object[]] $Steps, [string] $Workspace, [string] $Name, [int] $TimeoutSeconds, [switch] $ContinueOnFailure)
+    $scriptText = New-ScenarioShellScript -Shell $Shell -Steps $Steps -WorkingDirectory $Workspace -ContinueOnFailure:$ContinueOnFailure
+    $scriptDirectory = New-ScenarioDirectory -Name '_scripts'
+    $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    if ($Shell -eq 'cmd') {
+        $scriptPath = Join-Path $scriptDirectory "$Name-$Shell.cmd"
+        [IO.File]::WriteAllText($scriptPath, $scriptText, [System.Text.UTF8Encoding]::new($false))
+        # No /d: a new Command Prompt runs AutoRun commands too.
+        $arguments = "/s /c `"`"$scriptPath`" 2>&1`""
+    } else {
+        $exe = if ($Shell -eq 'pwsh') {
+            Find-ScenarioExecutable -Name 'pwsh.exe' -Environment $Script:ScenarioEnvironment
+        } else {
+            Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        }
+        if (-not $exe) { return @{ Missing = "PowerShell 7 isn't installed" } }
+        $scriptPath = Join-Path $scriptDirectory "$Name-$Shell.ps1.txt"
+        [IO.File]::WriteAllText($scriptPath, $scriptText, [System.Text.UTF8Encoding]::new($false))
+        # Read and run as text: the execution policy then applies only to the scripts the steps themselves start,
+        # exactly as it would for commands typed into a new window. The profile still loads.
+        $quotedPath = $scriptPath -replace "'", "''"
+        $arguments = "/d /s /c `"`"$exe`" -NoLogo -NonInteractive -Command `"iex ([IO.File]::ReadAllText('$quotedPath'))`" 2>&1`""
+    }
+    $run = [DevScenarioNative]::Run($cmd, $arguments, $Workspace, $Script:ScenarioEnvironment, $TimeoutSeconds, '')
+    $output = $run.Output.Trim() -replace '##DEVSCN-(STEP|EXIT)[^#]*##\r?\n?', ''
+    if ($output.Length -gt 20000) { $output = $output.Substring(0, 20000) + "`n... (truncated)" }
+    return @{ Missing = ''; Run = $run; Transcript = (Split-ScenarioTranscript -Output $run.Output); Output = $output }
+}
+
+# Runs every step in one new process of the shell without stopping at a failure, and returns one result per step
+# Tool, so a suite of small checks shows as one row each. Optional step keys: ExitCodes (default 0); Known, a
+# hashtable of shell (or '*') to an explanation, which turns a failure in that shell into a warning; and SkipIn,
+# a hashtable of shell (or '*') to the reason that step isn't run there.
+function Invoke-ScenarioToolsInShell {
+    param([hashtable] $Scenario, [string] $Shell, [string] $NamePrefix = '')
+    $shellTitle = $Script:ScenarioShells[$Shell]
+    $all = @($Scenario.Steps)
+    $byTool = [ordered]@{}
+    $runnable = [System.Collections.Generic.List[object]]::new()
+    $position = @{}
+    for ($i = 0; $i -lt $all.Count; $i++) {
+        $step = $all[$i]
+        if (-not $byTool.Contains($step.Tool)) { $byTool[$step.Tool] = [System.Collections.Generic.List[int]]::new() }
+        $byTool[$step.Tool].Add($i)
+        $skipIn = $step['SkipIn']
+        if (-not ($skipIn -and ($skipIn.ContainsKey($Shell) -or $skipIn.ContainsKey('*')))) {
+            $runnable.Add($step)
+            $position[$i] = $runnable.Count
+        }
+    }
+
+    $workspace = New-ScenarioDirectory -Name "$($Scenario.Name)-$Shell"
+    if ($Scenario['Setup']) { & $Scenario.Setup $workspace }
+    $timeout = if ($Scenario['Timeout']) { [int]$Scenario.Timeout } else { 300 }
+    $started = if ($runnable.Count) {
+        Start-ScenarioShellRun -Shell $Shell -Steps $runnable.ToArray() -Workspace $workspace -Name $Scenario.Name -TimeoutSeconds $timeout -ContinueOnFailure
+    } else { @{ Missing = '' } }
+
+    foreach ($tool in $byTool.Keys) {
+        $indexes = $byTool[$tool]
+        $result = New-ScenarioResult -Name "$NamePrefix$tool" -Title $tool -Shell $Shell -Expected ((@($indexes | ForEach-Object { $all[$_].Run })) -join '; ')
+        $skipStep = @($indexes | Where-Object { -not $position.ContainsKey($_) }) | Select-Object -First 1
+        if ($null -ne $skipStep) {
+            $skipIn = $all[$skipStep].SkipIn
+            $result.Status = 'Skip'
+            $result.Actual = if ($skipIn.ContainsKey($Shell)) { $skipIn[$Shell] } else { $skipIn['*'] }
+            $result
+            continue
+        }
+        if ($started.Missing) {
+            $result.Status = 'Skip'
+            $result.Actual = $started.Missing
+            $result
+            continue
+        }
+        $log = [System.Text.StringBuilder]::new()
+        $failure = $null
+        $failed = $null
+        $failedOutput = ''
+        $firstLine = ''
+        foreach ($index in $indexes) {
+            $step = $all[$index]
+            $text = Get-ScenarioStepText -Step $step -Shell $Shell -WorkingDirectory $workspace
+            $record = $started.Transcript.Steps[$position[$index]]
+            $output = if ($record) { $record.Output } else { '' }
+            [void]$log.AppendLine("> $text").AppendLine($output)
+            $codes = if ($step['ExitCodes']) { @($step.ExitCodes) } else { @(0) }
+            if (-not $record -or $null -eq $record.ExitCode) {
+                $failure = if ($started.Run.TimedOut) { "Didn't finish within $timeout seconds" } else { "Didn't finish" }
+            } elseif ($codes -notcontains $record.ExitCode) {
+                $failure = "Exited with $($record.ExitCode)"
+            } elseif ($step['Expect'] -and $output -notmatch $step.Expect) {
+                $failure = "Output didn't match what was expected"
+            }
+            if ($failure) { $failed = $step; $failedOutput = $output; break }
+            if (-not $firstLine) { $firstLine = Get-ScenarioFirstLine -Text $output }
+        }
+        $result.Output = $log.ToString().Trim()
+        if ($failure) {
+            $text = Get-ScenarioStepText -Step $failed -Shell $Shell -WorkingDirectory $workspace
+            $result.Message = "$text$([Environment]::NewLine)$failure"
+            $known = $failed['Known']
+            $explanation = if ($known -and $known.ContainsKey($Shell)) { $known[$Shell] } elseif ($known -and $known.ContainsKey('*')) { $known['*'] } else { '' }
+            if ($explanation) {
+                $result.Status = 'Warn'
+                $result.Actual = $explanation
+            } else {
+                $result.Status = 'Fail'
+                $reason = Get-ScenarioFailureReason -Text $failedOutput -Command $text -ShellTitle $shellTitle
+                $printed = Get-ScenarioFirstLine -Text $failedOutput
+                $result.Actual = if ($failure -like 'Output*') {
+                    if ($printed) { "Printed: $printed" } else { 'Printed nothing' }
+                } elseif ($reason) { $reason } else { $failure }
+            }
+        } else {
+            $result.Status = 'Pass'
+            $result.Actual = if ($firstLine) { $firstLine } else { 'Works' }
+        }
+        $result
+    }
+}
+
 # Runs a scenario's steps in a new process of the given shell and turns the transcript into a result.
 function Invoke-ScenarioInShell {
     param([hashtable] $Scenario, [string] $Shell)
@@ -471,38 +597,16 @@ function Invoke-ScenarioInShell {
         if ($Scenario['Setup']) { & $Scenario.Setup $workspace }
 
         $steps = @($Scenario.Steps)
-        $scriptText = New-ScenarioShellScript -Shell $Shell -Steps $steps -WorkingDirectory $workspace
-        $scriptDirectory = New-ScenarioDirectory -Name '_scripts'
-        $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
-        if ($Shell -eq 'cmd') {
-            $scriptPath = Join-Path $scriptDirectory "$($Scenario.Name)-$Shell.cmd"
-            [IO.File]::WriteAllText($scriptPath, $scriptText, [System.Text.UTF8Encoding]::new($false))
-            # No /d: a new Command Prompt runs AutoRun commands too.
-            $arguments = "/s /c `"`"$scriptPath`" 2>&1`""
-        } else {
-            $exe = if ($Shell -eq 'pwsh') {
-                Find-ScenarioExecutable -Name 'pwsh.exe' -Environment $Script:ScenarioEnvironment
-            } else {
-                Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            }
-            if (-not $exe) {
-                $result.Status = 'Skip'
-                $result.Actual = "PowerShell 7 isn't installed"
-                return $result
-            }
-            $scriptPath = Join-Path $scriptDirectory "$($Scenario.Name)-$Shell.ps1.txt"
-            [IO.File]::WriteAllText($scriptPath, $scriptText, [System.Text.UTF8Encoding]::new($false))
-            # Read and run as text: the execution policy then applies only to the scripts the steps themselves start,
-            # exactly as it would for commands typed into a new window. The profile still loads.
-            $quotedPath = $scriptPath -replace "'", "''"
-            $arguments = "/d /s /c `"`"$exe`" -NoLogo -NonInteractive -Command `"iex ([IO.File]::ReadAllText('$quotedPath'))`" 2>&1`""
-        }
-
         $timeout = if ($Scenario['Timeout']) { [int]$Scenario.Timeout } else { 300 }
-        $run = [DevScenarioNative]::Run($cmd, $arguments, $workspace, $Script:ScenarioEnvironment, $timeout, '')
-        $transcript = Split-ScenarioTranscript -Output $run.Output
-        $result.Output = $run.Output.Trim() -replace '##DEVSCN-(STEP|EXIT)[^#]*##\r?\n?', ''
-        if ($result.Output.Length -gt 20000) { $result.Output = $result.Output.Substring(0, 20000) + "`n... (truncated)" }
+        $started = Start-ScenarioShellRun -Shell $Shell -Steps $steps -Workspace $workspace -Name $Scenario.Name -TimeoutSeconds $timeout
+        if ($started.Missing) {
+            $result.Status = 'Skip'
+            $result.Actual = $started.Missing
+            return $result
+        }
+        $run = $started.Run
+        $transcript = $started.Transcript
+        $result.Output = $started.Output
 
         $shown = [System.Collections.Generic.List[string]]::new()
         for ($i = 1; $i -le $steps.Count; $i++) {
@@ -605,8 +709,10 @@ function New-ScenarioResult {
 }
 
 function Add-ScenarioResult {
-    param([Parameter(Mandatory)] $Result)
+    param([Parameter(Mandatory)] $Result, [switch] $Quiet)
     $Script:ScenarioResults.Add($Result)
+    # -Quiet keeps long suites readable: only results that need a look are printed.
+    if ($Quiet -and $Result.Status -in @('Pass', 'Skip')) { return }
     $glyph, $color = switch ($Result.Status) {
         'Pass'  { [string][char]0x2713, 'Green' }
         'Warn'  { '!', 'Yellow' }

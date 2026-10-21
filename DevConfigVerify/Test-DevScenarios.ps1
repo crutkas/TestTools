@@ -23,12 +23,16 @@
   Shells to run the command-line scenarios in: pwsh, powershell, cmd. Defaults to all three. Accepts a
   comma-separated list, also when passed through Run-Scenarios.cmd.
 
+.PARAMETER Experience
+  Standard (setup-standard.ps1) or Full (setup-full.ps1). Checks for what only Full installs, such as the
+  WinUI project templates, are skipped for Standard.
+
 .PARAMETER Only
   Run only these scenario groups, for example -Only Wsl. Uses the same group names as -Skip.
 
 .PARAMETER Skip
   Scenario groups to skip, for example -Skip Nvm,Wsl. Groups: Shells, Python, Uv, Node, Nvm, DotNet, Git,
-  VSCode, OhMyPosh, Terminal, IntelligentTerminal, WinApp, AzureCli, GitHubCli, Copilot, Wsl.
+  Coreutils, VSCode, OhMyPosh, Terminal, IntelligentTerminal, WinApp, AzureCli, GitHubCli, Copilot, Wsl.
 
 .PARAMETER Distribution
   WSL distribution to test. Setup installs Ubuntu.
@@ -54,6 +58,7 @@
 [CmdletBinding()]
 param(
     [string[]] $Shell = @('pwsh', 'powershell', 'cmd'),
+    [ValidateSet('Standard', 'Full')] [string] $Experience = 'Standard',
     [string[]] $Only = @(),
     [string[]] $Skip = @(),
     [string] $Distribution = 'Ubuntu',
@@ -76,7 +81,7 @@ try {
 . (Join-Path $PSScriptRoot 'DevScenarios.Common.ps1')
 
 $Shell = ConvertTo-ScenarioList -Value $Shell -Allowed @($Script:ScenarioShells.Keys) -Parameter 'Shell'
-$groupKeys = @('Shells', 'Python', 'Uv', 'Node', 'Nvm', 'DotNet', 'Git', 'VSCode', 'OhMyPosh', 'Terminal', 'IntelligentTerminal',
+$groupKeys = @('Shells', 'Python', 'Uv', 'Node', 'Nvm', 'DotNet', 'Git', 'Coreutils', 'VSCode', 'OhMyPosh', 'Terminal', 'IntelligentTerminal',
     'WinApp', 'AzureCli', 'GitHubCli', 'Copilot', 'Wsl')
 $Skip = ConvertTo-ScenarioList -Value $Skip -Allowed $groupKeys -Parameter 'Skip'
 $Only = ConvertTo-ScenarioList -Value $Only -Allowed $groupKeys -Parameter 'Only'
@@ -111,7 +116,7 @@ $gitIdentity = '-c user.name=DevScenarios -c user.email=devscenarios@example.inv
 
 $scenarioGroups = @(
     @{
-        Key = 'Shells'; Title = 'Shells'
+        Key = 'Shells'; Title = 'Shells'; Custom = { Invoke-PathScenario }
         Scenarios = @(
             @{
                 Name = 'ShellStart'; Title = 'Starts in a new window'; CleanStart = $true; Timeout = 60
@@ -208,7 +213,7 @@ $scenarioGroups = @(
                 )
             }
             @{
-                Name = 'DotnetWinUITemplates'; Title = 'WinUI project templates'; Timeout = 120; AnyShell = $true
+                Name = 'DotnetWinUITemplates'; Title = 'WinUI project templates'; Timeout = 120; AnyShell = $true; Experience = 'Full'
                 Expected = 'dotnet new lists WinUI templates'
                 Steps = @(@{ Run = 'dotnet new list winui'; Expect = '(?i)winui'; Show = 'match'; Why = 'No WinUI templates are installed for dotnet new.'
                         ExitWhy = @{ 103 = 'No WinUI templates are installed for dotnet new.' } })
@@ -248,6 +253,9 @@ $scenarioGroups = @(
                 }
             }
         )
+    }
+    @{
+        Key = 'Coreutils'; Title = 'Coreutils for Windows'; Custom = { Invoke-CoreutilsScenarios }
     }
     @{
         Key = 'VSCode'; Title = 'Visual Studio Code'
@@ -347,6 +355,13 @@ $scenarioGroups = @(
 
 function Invoke-MatrixScenario {
     param([hashtable] $Scenario)
+    if ($Scenario['Experience'] -eq 'Full' -and $Experience -ne 'Full') {
+        $skipped = New-ScenarioResult -Name $Scenario.Name -Title $Scenario.Title -Expected $Scenario['Expected']
+        $skipped.Status = 'Skip'
+        $skipped.Actual = 'Only the Full experience installs this. Run with -Experience Full to check it.'
+        Add-ScenarioResult -Result $skipped
+        return
+    }
     $shells = if ($Scenario['Shells']) { @($Shell | Where-Object { $Scenario.Shells -contains $_ }) } else { $Shell }
     if ($Scenario['AnyShell']) { $shells = @($shells | Select-Object -First 1) }
     if (-not $shells) {
@@ -381,6 +396,287 @@ function Test-ScenarioMsix {
 
 #endregion
 
+#region Coreutils
+
+# PATH entries like %NVM_HOME% stay literal when the variable they name is itself an expandable string, because
+# Windows doesn't expand nested variables. Every new process then misses that folder.
+function Get-ScenarioUnexpandedPath {
+    return @(([string]$Script:ScenarioEnvironment['Path']) -split ';' | Where-Object { $_ -match '%[^%;]+%' })
+}
+
+function Invoke-PathScenario {
+    $result = New-ScenarioResult -Name 'PathExpanded' -Title 'PATH has no unexpanded variables' -Expected 'Every PATH entry a new terminal gets is a real folder path'
+    $unexpanded = Get-ScenarioUnexpandedPath
+    if ($unexpanded.Count) {
+        $result.Actual = "A new terminal's PATH contains $($unexpanded -join ', ')"
+        $result.Message = 'Windows doesn''t expand a variable inside PATH when that variable is itself an expandable string, so programs in those folders aren''t found. Store the variable as a plain string, or put the folder itself on PATH.'
+    } else {
+        $result.Status = 'Pass'
+        $result.Actual = "$(@(([string]$Script:ScenarioEnvironment['Path']) -split ';' | Where-Object { $_ }).Count) entries, all expanded"
+    }
+    Add-ScenarioResult -Result $result
+}
+
+# Inputs for the utilities, with LF line endings as files from Linux tools have.
+$Script:CoreutilsFixtures = [ordered]@{
+    'fruits.txt' = "banana`napple`ncherry`napple`n"
+    'sorted.txt' = "apple`napple`nbanana`n"
+    'nums.txt'   = "3`n1`n2`n"
+    'hello.txt'  = "hello`n"
+    'words.txt'  = "the quick brown fox jumps over the lazy dog`n"
+    'left.txt'   = "1 alpha`n2 beta`n3 gamma`n"
+    'right.txt'  = "1 one`n3 three`n"
+    'comm1.txt'  = "a`nb`nc`n"
+    'comm2.txt'  = "b`nc`nd`n"
+    'colon.txt'  = "a:b:c`n"
+    'spaces.txt' = "        x`n"
+    'tsort.txt'  = "a b`nb c`n"
+    'abcd.txt'   = "a b c d`n"
+    'tomove.txt' = "moved`n"
+    'remove.txt' = "remove`n"
+    'unlink.txt' = "unlink`n"
+    'trunc.txt'  = "truncate me`n"
+}
+
+# Command Prompt runs its own echo, date, mkdir, and rmdir even when typed as echo.exe; a quoted name reaches Coreutils.
+$Script:CmdBuiltins = @('echo', 'date', 'mkdir', 'rmdir')
+
+# Writes a command the way a user would type it in each shell. PowerShell aliases shadow cat, cp, ls, sort, and
+# others, so PowerShell calls <name>.exe; the interactive Coreutils integration that rewrites typed names is
+# checked by Test-DevConfig.ps1.
+function ConvertTo-CoreutilsCommand {
+    param([string] $Command, [string] $Shell)
+    $segments = foreach ($segment in ($Command -split ' \| ')) {
+        $name, $rest = $segment -split ' ', 2
+        $call = if ($Shell -eq 'cmd') {
+            if ($Script:CmdBuiltins -contains $name) { "`"$name.exe`"" } else { $name }
+        } else { "$name.exe" }
+        (@($call, $rest) | Where-Object { $_ }) -join ' '
+    }
+    return $segments -join ' | '
+}
+
+function New-CoreutilsStep {
+    param([string] $Tool, [string] $Command, [string] $Expect = '', [int[]] $ExitCodes = @(0), [hashtable] $Known = @{}, [hashtable] $SkipIn = @{})
+    @{
+        Tool      = $Tool
+        Run       = $Command
+        Cmd       = ConvertTo-CoreutilsCommand -Command $Command -Shell 'cmd'
+        Ps        = ConvertTo-CoreutilsCommand -Command $Command -Shell 'ps'
+        Expect    = $Expect
+        ExitCodes = $ExitCodes
+        Known     = $Known
+        SkipIn    = $SkipIn
+    }
+}
+
+$psGlob = "PowerShell passes `"*.txt`" to programs without its quotes, so Coreutils expands the wildcard itself before find sees it. At an interactive prompt, the Coreutils integration keeps the quotes."
+$xargsEscape = 'find prints paths like .\fruits.txt, and xargs reads \ as an escape character, so the paths arrive broken. find -print0 | xargs -0 works.'
+$ps51Bytes = 'Windows PowerShell 5.1 passes text, not bytes, between programs and rewrites line endings. PowerShell 7.4 and later keep the bytes.'
+
+# One row per utility; consecutive steps with the same tool make up one check. Rows run in this order in one
+# process per shell, and each check uses its own files, so one failure doesn't cascade into the next.
+$Script:CoreutilsSteps = @(
+    New-CoreutilsStep '[' '[ -f fruits.txt ]' -SkipIn @{ pwsh = 'PowerShell can''t run a command named [; test does the same'; powershell = 'PowerShell can''t run a command named [; test does the same' }
+    New-CoreutilsStep 'arch' 'arch' '^(x86_64|aarch64|arm64)'
+    New-CoreutilsStep 'b2sum' 'b2sum hello.txt' '^f60ce482e5cc1229f39d71313171a8d9f4ca3a87d066bf4b205effb528192a75f14f3271e2c1a90e1de53f275b4d4793eef2f5e31ea90d2ce29d2e481c36435f\s'
+    New-CoreutilsStep 'base32' 'base32 hello.txt' '^NBSWY3DPBI======'
+    New-CoreutilsStep 'base64' 'base64 hello.txt' '^aGVsbG8K'
+    New-CoreutilsStep 'basename' 'basename C:/x/y/file.txt .txt' '^file\s*$'
+    New-CoreutilsStep 'basenc' 'basenc --base16 hello.txt' '^68656C6C6F0A'
+    New-CoreutilsStep 'cat' 'cat fruits.txt' '^banana\s+apple\s+cherry\s+apple\s*$'
+    New-CoreutilsStep 'cksum' 'cksum hello.txt' '^3015617425 6 '
+    New-CoreutilsStep 'comm' 'comm -12 comm1.txt comm2.txt' '^b\s+c\s*$'
+    New-CoreutilsStep 'coreutils-manager' 'coreutils-manager status' '(?m)^ls\s+(enabled|disabled)'
+    New-CoreutilsStep 'cp' 'cp fruits.txt copy.txt'
+    New-CoreutilsStep 'cp' 'cat copy.txt' '^banana'
+    New-CoreutilsStep 'csplit' 'csplit -s fruits.txt 3'
+    New-CoreutilsStep 'csplit' 'cat xx01' '^cherry\s+apple\s*$'
+    New-CoreutilsStep 'cut' 'cut -d: -f2 colon.txt' '^b\s*$'
+    New-CoreutilsStep 'date' 'date --iso-8601 -d 2020-02-29' '^2020-02-29\s*$'
+    New-CoreutilsStep 'df' 'df .' 'Filesystem'
+    New-CoreutilsStep 'dirname' 'dirname a/b/c' '^a[\\/]b\s*$'
+    New-CoreutilsStep 'du' 'du -s .' '^\d+\s+\.'
+    New-CoreutilsStep 'echo' 'echo devscenario' '^devscenario\s*$'
+    New-CoreutilsStep 'env' 'env' '(?im)^path='
+    New-CoreutilsStep 'expr' 'expr 6 + 7' '^13\s*$'
+    New-CoreutilsStep 'factor' 'factor 84' '^84: 2 2 3 7\s*$'
+    New-CoreutilsStep 'false' 'false' -ExitCodes 1
+    New-CoreutilsStep 'find' 'find . -name fruits.txt' 'fruits\.txt'
+    New-CoreutilsStep 'fmt' 'fmt -w 15 words.txt' '^the quick brown\s+fox jumps over'
+    New-CoreutilsStep 'fold' 'fold -w 9 words.txt' '^the quick\s'
+    New-CoreutilsStep 'grep' 'grep -n apple fruits.txt' '^2:apple'
+    New-CoreutilsStep 'head' 'head -n 1 fruits.txt' '^banana\s*$'
+    New-CoreutilsStep 'hostname' 'hostname' '^\S+\s*$'
+    New-CoreutilsStep 'join' 'join left.txt right.txt' '^1 alpha one\s+3 gamma three\s*$'
+    New-CoreutilsStep 'link' 'link fruits.txt linked.txt'
+    New-CoreutilsStep 'link' 'cat linked.txt' '^banana'
+    New-CoreutilsStep 'ln' 'ln fruits.txt hard.txt'
+    New-CoreutilsStep 'ln' 'cat hard.txt' '^banana'
+    New-CoreutilsStep 'ls' 'ls -1' '(?m)^fruits\.txt\s*$'
+    New-CoreutilsStep 'md5sum' 'md5sum hello.txt' '^b1946ac92492d2347c6235b4d2611184\s'
+    New-CoreutilsStep 'mkdir' 'mkdir -p d1/d2'
+    New-CoreutilsStep 'mkdir' 'test -d d1/d2'
+    New-CoreutilsStep 'mktemp' 'mktemp -p .' 'tmp\.\w+'
+    New-CoreutilsStep 'mv' 'mv tomove.txt moved.txt'
+    New-CoreutilsStep 'mv' 'cat moved.txt' '^moved'
+    New-CoreutilsStep 'nl' 'nl fruits.txt' '^\s*1\s+banana'
+    New-CoreutilsStep 'nproc' 'nproc' '^\d+\s*$'
+    New-CoreutilsStep 'numfmt' 'numfmt --to=iec 2048' '^2\.0K\s*$'
+    New-CoreutilsStep 'od' 'od -An -tx1 hello.txt' '68 65 6c 6c 6f 0a'
+    New-CoreutilsStep 'paste' 'paste nums.txt fruits.txt' "^3\tbanana"
+    New-CoreutilsStep 'pathchk' 'pathchk -p good_name.txt'
+    New-CoreutilsStep 'pr' 'pr -t fruits.txt' '^banana'
+    New-CoreutilsStep 'printenv' 'printenv PATH' '\S'
+    New-CoreutilsStep 'printf' 'printf "devscenario\n"' '^devscenario\s*$'
+    New-CoreutilsStep 'ptx' 'ptx words.txt' 'quick'
+    New-CoreutilsStep 'pwd' 'pwd' '(?i)Coreutils'
+    New-CoreutilsStep 'readlink' 'readlink -f fruits.txt' '(?i)Coreutils.*fruits\.txt'
+    New-CoreutilsStep 'realpath' 'realpath fruits.txt' '(?i)Coreutils.*fruits\.txt'
+    New-CoreutilsStep 'rm' 'rm remove.txt'
+    New-CoreutilsStep 'rm' 'test -e remove.txt' -ExitCodes 1
+    New-CoreutilsStep 'rmdir' 'rmdir emptydir'
+    New-CoreutilsStep 'rmdir' 'test -d emptydir' -ExitCodes 1
+    New-CoreutilsStep 'seq' 'seq 3' '^1\s+2\s+3\s*$'
+    New-CoreutilsStep 'sha1sum' 'sha1sum hello.txt' '^f572d396fae9206628714fb2ce00f72e94f2258f\s'
+    New-CoreutilsStep 'sha224sum' 'sha224sum hello.txt' '^2d6d67d91d0badcdd06cbbba1fe11538a68a37ec9c2e26457ceff12b\s'
+    New-CoreutilsStep 'sha256sum' 'sha256sum hello.txt' '^5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03\s'
+    New-CoreutilsStep 'sha384sum' 'sha384sum hello.txt' '^1d0f284efe3edea4b9ca3bd514fa134b17eae361ccc7a1eefeff801b9bd6604e01f21f6bf249ef030599f0c218f2ba8c\s'
+    New-CoreutilsStep 'sha512sum' 'sha512sum hello.txt' '^e7c22b994c59d9cf2b48e549b1e24666636045930d3da7c1acb299d1c3b7f931f94aae41edda2c2b207a36e10f8bcb8d45223e54878f5b316e7ce3b6bc019629\s'
+    New-CoreutilsStep 'shuf' 'shuf -i 1-3' '^(?=[\s\S]*1)(?=[\s\S]*2)(?=[\s\S]*3)'
+    New-CoreutilsStep 'sleep' 'sleep 0.1'
+    New-CoreutilsStep 'sort' 'sort -u -r fruits.txt' '^cherry\s+banana\s+apple\s*$'
+    New-CoreutilsStep 'split' 'split -l 2 fruits.txt part_'
+    New-CoreutilsStep 'split' 'cat part_ab' '^cherry\s+apple\s*$'
+    New-CoreutilsStep 'stat' 'stat fruits.txt' 'Size:\s*26\b'
+    New-CoreutilsStep 'sum' 'sum hello.txt' '^36979\s+1\b'
+    New-CoreutilsStep 'tac' 'tac fruits.txt' '^apple\s+cherry\s+apple\s+banana\s*$'
+    New-CoreutilsStep 'tail' 'tail -n 1 fruits.txt' '^apple\s*$'
+    New-CoreutilsStep 'tee' 'cat hello.txt | tee teed.txt' '^hello'
+    New-CoreutilsStep 'tee' 'cat teed.txt' '^hello'
+    New-CoreutilsStep 'test' 'test 2 -gt 1'
+    New-CoreutilsStep 'touch' 'touch touched.txt'
+    New-CoreutilsStep 'touch' 'test -f touched.txt'
+    New-CoreutilsStep 'tr' 'cat hello.txt | tr a-z A-Z' '^HELLO\s*$'
+    New-CoreutilsStep 'true' 'true'
+    New-CoreutilsStep 'truncate' 'truncate -s 4 trunc.txt'
+    New-CoreutilsStep 'truncate' 'wc -c trunc.txt' '^\s*4\s'
+    New-CoreutilsStep 'tsort' 'tsort tsort.txt' '^a\s+b\s+c\s*$'
+    New-CoreutilsStep 'unexpand' 'unexpand -a spaces.txt' "^\tx\s*$"
+    New-CoreutilsStep 'uniq' 'uniq -c sorted.txt' '^\s*2 apple\s+1 banana\s*$'
+    New-CoreutilsStep 'unlink' 'unlink unlink.txt'
+    New-CoreutilsStep 'unlink' 'test -e unlink.txt' -ExitCodes 1
+    New-CoreutilsStep 'uptime' 'uptime' '\bup\b'
+    New-CoreutilsStep 'wc' 'wc -l fruits.txt' '^\s*4 fruits\.txt'
+    New-CoreutilsStep 'xargs' 'cat abcd.txt | xargs -n 2 echo' '^a b\s+c d\s*$'
+    New-CoreutilsStep 'seq | sort | head' 'seq 1 5 | sort -r | head -n 1' '^5\b'
+    New-CoreutilsStep 'cat | od (bytes)' 'cat hello.txt | od -An -tx1' '68 65 6c 6c 6f 0a\s*$' -Known @{ powershell = $ps51Bytes }
+    New-CoreutilsStep 'find -print0 | xargs -0' 'find . -name fruits.txt -print0 | xargs -0 wc -l' '4 .*fruits\.txt' -Known @{ powershell = $ps51Bytes }
+    New-CoreutilsStep 'find | xargs' 'find . -name fruits.txt | xargs wc -l' '4 .*fruits\.txt' -Known @{ '*' = $xargsEscape }
+    New-CoreutilsStep 'find with a quoted wildcard' 'find . -name "*.txt"' '(?s)fruits\.txt.*words\.txt|(?s)words\.txt.*fruits\.txt' -Known @{ pwsh = $psGlob; powershell = $psGlob }
+)
+
+# yes never ends on its own, so it runs separately with a short time limit: a pipe that doesn't stop it can't hold up the rest.
+$Script:CoreutilsYesStep = New-CoreutilsStep 'yes | head' 'yes devscenario | head -n 2' '^devscenario\s+devscenario\b' `
+    -Known @{
+        pwsh       = 'The output is right, but PowerShell 7 reports "The pipe is being closed" as an error when head exits before yes does.'
+        powershell = 'In Windows PowerShell 5.1, yes keeps running after head exits, so the pipeline never finishes.'
+    }
+
+# Finds the install the way a user reaches it: ls.exe on PATH inside Coreutils' bin folder, else the installed location.
+function Get-CoreutilsInstall {
+    $ls = Find-ScenarioExecutable -Name 'ls.exe' -Environment $Script:ScenarioEnvironment
+    if ($ls) {
+        $bin = Split-Path -Path $ls -Parent
+        $root = Split-Path -Path $bin -Parent
+        if (Test-Path -LiteralPath (Join-Path $root 'coreutils.exe')) { return [pscustomobject]@{ Root = $root; Bin = $bin; OnPath = $true } }
+    }
+    $candidates = @(
+        foreach ($rootKey in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')) {
+            foreach ($key in @(Get-ChildItem -LiteralPath $rootKey -ErrorAction SilentlyContinue)) {
+                if ([string]$key.GetValue('DisplayName') -match '(?i)coreutils') { [string]$key.GetValue('InstallLocation') }
+            }
+        }
+        Join-Path $env:ProgramFiles 'coreutils'
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ 'coreutils.exe')) }
+    $root = @($candidates) | Select-Object -First 1
+    if ($root) { return [pscustomobject]@{ Root = $root.TrimEnd('\'); Bin = Join-Path $root.TrimEnd('\') 'bin'; OnPath = $false } }
+    return $null
+}
+
+function Invoke-CoreutilsScenarios {
+    $install = Get-CoreutilsInstall
+    $setup = New-ScenarioResult -Name 'CoreutilsInstall' -Title 'Installed and on PATH' -Expected 'Coreutils'' bin folder is on PATH ahead of Windows'' find, sort, and hostname'
+    if (-not $install) {
+        $setup.Actual = "Coreutils isn't installed"
+        Add-ScenarioResult -Result $setup
+        return
+    }
+    if (-not $install.OnPath) {
+        $setup.Actual = "Installed at $($install.Root), but its bin folder isn't on PATH"
+        Add-ScenarioResult -Result $setup
+        return
+    }
+    $version = Invoke-ScenarioCommand -CommandLine "`"$($install.Root)\coreutils.exe`" --version" -TimeoutSeconds 30
+    $shadowed = @(foreach ($name in @('find', 'sort', 'hostname')) {
+            $found = Find-ScenarioExecutable -Name "$name.exe" -Environment $Script:ScenarioEnvironment
+            if ($found -and -not $found.StartsWith($install.Bin + '\', [StringComparison]::OrdinalIgnoreCase)) { $found }
+        })
+    if ($shadowed.Count) {
+        $setup.Actual = "PATH finds $($shadowed -join ', ') before Coreutils"
+        $setup.Message = "Coreutils is in $($install.Bin), which should come before System32 on PATH."
+    } else {
+        $setup.Status = 'Pass'
+        $setup.Actual = "$(Get-ScenarioFirstLine -Text $version.Output) in $($install.Bin)"
+    }
+    Add-ScenarioResult -Result $setup
+
+    # Utilities this install provides as commands (not every name in coreutils --list gets one, such as [),
+    # and the ones turned off with coreutils-manager.
+    $listed = @(Get-ChildItem -LiteralPath $install.Bin -Filter '*.exe' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName })
+    $status = (Invoke-ScenarioCommand -CommandLine "`"$($install.Root)\coreutils.exe`" coreutils-manager status" -TimeoutSeconds 30).Output
+    $disabled = @([regex]::Matches($status, '(?im)^(\S+)\s+disabled\s*$') | ForEach-Object { $_.Groups[1].Value })
+    $tested = @(@($Script:CoreutilsSteps + $Script:CoreutilsYesStep) | ForEach-Object { $_.Run -split ' \| ' | ForEach-Object { ($_ -split ' ')[0] } } | Select-Object -Unique)
+    $steps = foreach ($step in $Script:CoreutilsSteps) {
+        $copy = $step.Clone()
+        $names = @($step.Run -split ' \| ' | ForEach-Object { ($_ -split ' ')[0] })
+        $off = @($names | Where-Object { $disabled -contains $_ }) | Select-Object -First 1
+        $missing = @($names | Where-Object { $listed -notcontains $_ }) | Select-Object -First 1
+        if ($off) { $copy.SkipIn = @{ '*' = "$off is turned off with coreutils-manager" } }
+        elseif ($missing) { $copy.SkipIn = @{ '*' = "This install has no $missing command" } }
+        $copy
+    }
+
+    $fixtures = {
+        param($Workspace)
+        foreach ($name in $Script:CoreutilsFixtures.Keys) {
+            [IO.File]::WriteAllText((Join-Path $Workspace $name), $Script:CoreutilsFixtures[$name])
+        }
+        New-Item -ItemType Directory -Path (Join-Path $Workspace 'emptydir') -Force | Out-Null
+    }
+    $suite = @{ Name = 'Coreutils'; Steps = @($steps); Setup = $fixtures; Timeout = 300 }
+    $yes = @{ Name = 'CoreutilsYes'; Steps = @($Script:CoreutilsYesStep); Timeout = 30 }
+    foreach ($name in $Shell) {
+        $results = @(Invoke-ScenarioToolsInShell -Scenario $suite -Shell $name -NamePrefix 'cu-') + @(Invoke-ScenarioToolsInShell -Scenario $yes -Shell $name -NamePrefix 'cu-')
+        foreach ($result in $results) { Add-ScenarioResult -Result $result -Quiet }
+        $passed = @($results | Where-Object { $_.Status -eq 'Pass' }).Count
+        $run = @($results | Where-Object { $_.Status -ne 'Skip' }).Count
+        $color = if (@($results | Where-Object { $_.Status -in @('Fail', 'Error') }).Count) { 'Red' } elseif ($passed -lt $run) { 'Yellow' } else { 'Green' }
+        Write-Host ("  {0} of {1} checks pass in {2}" -f $passed, $run, $Script:ScenarioShells[$name]) -ForegroundColor $color
+    }
+
+    # A utility this script doesn't know yet is reported, so new releases don't go untested unnoticed.
+    $untested = @($listed | Where-Object { $tested -notcontains $_ })
+    if ($untested.Count) {
+        $new = New-ScenarioResult -Name 'CoreutilsUntested' -Title 'Utilities without a check' -Expected 'Every utility in coreutils --list has a check'
+        $new.Status = 'Warn'
+        $new.Actual = "No check yet for: $($untested -join ', ')"
+        Add-ScenarioResult -Result $new
+    }
+}
+
+#endregion
+
 #region nvm
 
 function Get-ScenarioVersionText {
@@ -409,6 +705,10 @@ function Invoke-NvmScenarios {
     if ($version.ExitCode -ne 0 -or -not $nvmVersion) {
         $ready.Actual = "nvm didn't run"
         $ready.Message = Get-ScenarioFailureReason -Text $version.Output -Command 'nvm version' -ShellTitle 'Command Prompt'
+        $nvmEntries = @(Get-ScenarioUnexpandedPath | Where-Object { $_ -match '(?i)NVM' })
+        if ($nvmEntries.Count) {
+            $ready.Message += " PATH has $($nvmEntries -join ' and ') unexpanded, so new terminals can't find nvm or the node it selects."
+        }
         Add-ScenarioResult -Result $ready
         return
     }
@@ -694,11 +994,10 @@ function Invoke-WslScenarios {
 foreach ($group in $scenarioGroups) {
     if ($Only.Count -and $Only -notcontains $group.Key) { continue }
     Invoke-ScenarioGroup -Title $group.Title -Skip $Skip -Key $group.Key -Body {
-        if ($group['Custom']) {
-            & $group.Custom
-        } else {
+        if ($group['Scenarios']) {
             foreach ($scenario in $group.Scenarios) { Invoke-MatrixScenario -Scenario $scenario }
         }
+        if ($group['Custom']) { & $group.Custom }
     }
 }
 
