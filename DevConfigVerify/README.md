@@ -51,6 +51,7 @@ Each step gets one of three results:
   - Packages show the version WinGet reports.
   - Other steps show setup's own pass/fail check.
 - **Functional probes.** Every package is also probed directly, for example with `uv --version`, by looking up its MSIX registration, by reading the VC++ runtime key, or by searching installed programs. Tools installed outside WinGet are recognized, and versions still appear when only `winget.exe` is available. When setup's exact check fails for the Oh My Posh profile or the Copilot Terminal profile, the script also looks for the same outcome reached another way.
+- **The PATH a new terminal gets.** Probes run with the PATH Windows builds for a newly opened terminal, not one rebuilt from the registry through .NET. .NET expands entries such as `%NVM_HOME%` that Windows leaves literal when the variable is itself an expandable string, so a .NET-rebuilt PATH can find tools a user's terminal can't. The **New terminal** row fails when any PATH entry is left unexpanded.
 - **Copilot plugins.** The marketplace step passes when `copilot plugin marketplace list` shows `win-dev-skills` or `awesome-copilot`. The WinUI plugin step passes for `winui@win-dev-skills` or `winui@awesome-copilot`. Older setups used awesome-copilot.
 - **Visual check.** The script captures these windows right after the checks, so both describe the same moment:
   - The relevant Settings pages, with collapsed sections expanded and long pages captured screen by screen.
