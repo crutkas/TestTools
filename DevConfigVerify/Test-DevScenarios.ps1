@@ -471,6 +471,7 @@ function New-CoreutilsStep {
 }
 
 $psGlob = "PowerShell passes `"*.txt`" to programs without its quotes, so Coreutils expands the wildcard itself before find sees it. At an interactive prompt, the Coreutils integration keeps the quotes."
+$psDosFind = 'PowerShell drops the quotes around "apple" when it starts find, so find reads it as a path instead of Windows-style search text. Command Prompt keeps them, and so does the interactive Coreutils integration.'
 $xargsEscape = 'find prints paths like .\fruits.txt, and xargs reads \ as an escape character, so the paths arrive broken. find -print0 | xargs -0 works.'
 $ps51Bytes = 'Windows PowerShell 5.1 passes text, not bytes, between programs and rewrites line endings. PowerShell 7.4 and later keep the bytes.'
 
@@ -503,6 +504,9 @@ $Script:CoreutilsSteps = @(
     New-CoreutilsStep 'factor' 'factor 84' '^84: 2 2 3 7\s*$'
     New-CoreutilsStep 'false' 'false' -ExitCodes 1
     New-CoreutilsStep 'find' 'find . -name fruits.txt' 'fruits\.txt'
+    # Coreutils documents find and sort as integrated ports of the Windows commands, so their Windows syntax must work too.
+    New-CoreutilsStep 'find (Windows syntax)' 'find "apple" fruits.txt' '(?m)^apple\s*$' -Known @{ pwsh = $psDosFind; powershell = $psDosFind }
+    New-CoreutilsStep 'find (Windows syntax)' 'find /c "apple" fruits.txt' ':\s*2\s*$' -Known @{ pwsh = $psDosFind; powershell = $psDosFind }
     New-CoreutilsStep 'fmt' 'fmt -w 15 words.txt' '^the quick brown\s+fox jumps over'
     New-CoreutilsStep 'fold' 'fold -w 9 words.txt' '^the quick\s'
     New-CoreutilsStep 'grep' 'grep -n apple fruits.txt' '^2:apple'
@@ -546,6 +550,7 @@ $Script:CoreutilsSteps = @(
     New-CoreutilsStep 'shuf' 'shuf -i 1-3' '^(?=[\s\S]*1)(?=[\s\S]*2)(?=[\s\S]*3)'
     New-CoreutilsStep 'sleep' 'sleep 0.1'
     New-CoreutilsStep 'sort' 'sort -u -r fruits.txt' '^cherry\s+banana\s+apple\s*$'
+    New-CoreutilsStep 'sort (Windows syntax)' 'sort /R fruits.txt' '^cherry\s+banana\s+apple\s+apple\s*$'
     New-CoreutilsStep 'split' 'split -l 2 fruits.txt part_'
     New-CoreutilsStep 'split' 'cat part_ab' '^cherry\s+apple\s*$'
     New-CoreutilsStep 'stat' 'stat fruits.txt' 'Size:\s*26\b'

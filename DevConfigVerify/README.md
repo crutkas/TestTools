@@ -173,12 +173,13 @@ Command-line scenarios run in a new PowerShell 7, Windows PowerShell 5.1, and Co
 
 Each scenario works in its own folder under `%TEMP%\DevScenarios-<timestamp>`, which is deleted at the end. Package caches remain: pip, npm, uv, NuGet, and the Windows SDK build tools winapp downloads. The nvm scenario puts nvm back the way it found it. A full run takes several minutes, mostly package downloads and three .NET builds.
 
-Some Coreutils checks hit known platform behavior rather than a broken install. Those show as warnings that explain the cause:
+Some Coreutils checks hit known platform behavior rather than a broken install. Those show as warnings that explain the cause. Coreutils' own README lists PowerShell 7.4 or later as required; the Windows PowerShell 5.1 column shows what works there anyway.
 
 | Check | Where | Why |
 | --- | --- | --- |
 | `find \| xargs` | All shells | `find` prints paths like `.\fruits.txt`, and `xargs` reads `\` as an escape character. `find -print0 \| xargs -0` works. |
 | `find -name "*.txt"` | PowerShell | PowerShell drops the quotes when it starts a program, so Coreutils expands the wildcard itself. At an interactive prompt, the Coreutils integration keeps the quotes. |
+| `find "apple" file` (Windows syntax) | PowerShell | Same cause: without its quotes, `find` reads the search text as a path. Command Prompt keeps the quotes. |
 | `cat \| od`, `find -print0 \| xargs -0` | Windows PowerShell 5.1 | 5.1 passes text, not bytes, between programs. PowerShell 7.4 and later keep the bytes. |
 | `yes \| head` | PowerShell | PowerShell 7 reports "The pipe is being closed" although the output is right. In Windows PowerShell 5.1 the pipeline never ends, so it's stopped after 30 seconds. |
 
