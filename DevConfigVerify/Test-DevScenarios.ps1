@@ -406,7 +406,7 @@ function Get-ScenarioUnexpandedPath {
 
 function Invoke-PathScenario {
     $result = New-ScenarioResult -Name 'PathExpanded' -Title 'PATH has no unexpanded variables' -Expected 'Every PATH entry a new terminal gets is a real folder path'
-    $unexpanded = Get-ScenarioUnexpandedPath
+    $unexpanded = @(Get-ScenarioUnexpandedPath)
     if ($unexpanded.Count) {
         $result.Actual = "A new terminal's PATH contains $($unexpanded -join ', ')"
         $result.Message = 'Windows doesn''t expand a variable inside PATH when that variable is itself an expandable string, so programs in those folders aren''t found. Store the variable as a plain string, or put the folder itself on PATH.'
