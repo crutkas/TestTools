@@ -79,7 +79,7 @@ try {
     Write-Verbose "Could not force UTF-8 console encoding: $($_.Exception.Message)"
 }
 
-$VerifyToolVersion = '1.6.0'
+$VerifyToolVersion = '1.7.0'
 
 if ($Workload -ne 'devconfig' -and -not $PSBoundParameters.ContainsKey('Experience')) {
     $Experience = 'Full'
@@ -1790,6 +1790,55 @@ function Invoke-VerifyScreenshots {
 
 #region Report
 
+# The environment Windows builds for a new process for this user, as Explorer and Terminal get it.
+$newTerminalSource = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class DevConfigVerifyEnvironment
+{
+    [DllImport("userenv.dll", SetLastError = true)] private static extern bool CreateEnvironmentBlock(out IntPtr environment, IntPtr token, bool inherit);
+    [DllImport("userenv.dll", SetLastError = true)] private static extern bool DestroyEnvironmentBlock(IntPtr environment);
+    [DllImport("advapi32.dll", SetLastError = true)] private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
+
+    public static string NewUserPath()
+    {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0008 | 0x0002, out token)) { throw new Win32Exception(); }
+        IntPtr block = IntPtr.Zero;
+        try
+        {
+            if (!CreateEnvironmentBlock(out block, token, false)) { throw new Win32Exception(); }
+            IntPtr cursor = block;
+            while (true)
+            {
+                string entry = Marshal.PtrToStringUni(cursor);
+                if (String.IsNullOrEmpty(entry)) { return null; }
+                if (entry.StartsWith("Path=", StringComparison.OrdinalIgnoreCase)) { return entry.Substring(5); }
+                cursor = new IntPtr(cursor.ToInt64() + (entry.Length + 1) * 2);
+            }
+        }
+        finally
+        {
+            if (block != IntPtr.Zero) { DestroyEnvironmentBlock(block); }
+            CloseHandle(token);
+        }
+    }
+}
+'@
+
+function Get-VerifyNewTerminalPath {
+    if (-not ('DevConfigVerifyEnvironment' -as [type])) {
+        Add-Type -TypeDefinition $newTerminalSource
+    }
+    $path = [DevConfigVerifyEnvironment]::NewUserPath()
+    if (-not $path) { throw 'The new environment has no PATH.' }
+    return $path
+}
+
 function ConvertTo-VerifyHtmlText {
     param([AllowNull()] $Value)
     if ($null -eq $Value) { return '' }
@@ -2063,6 +2112,33 @@ if ($isElevated) {
 
 # Tools installed after this shell started are found only after PATH is refreshed.
 Update-DevConfigSessionPath
+# Probe with the PATH a newly opened terminal gets. The refresh above rebuilds PATH through .NET, which expands
+# entries such as %NVM_HOME% that Windows itself leaves literal, so it can find tools a user's terminal can't.
+$newTerminalPathError = ''
+try {
+    $env:Path = Get-VerifyNewTerminalPath
+} catch {
+    $newTerminalPathError = $_.Exception.Message
+}
+
+$Script:DevConfigPhaseTitle = 'New terminal'
+Write-Host ''
+Write-Host $Script:DevConfigPhaseTitle -ForegroundColor Cyan
+$pathResult = New-VerifyResult -Name 'NewTerminalPath' -Title 'PATH a new terminal gets' -Kind 'Smoke'
+$pathResult.Expected = 'Every entry expanded'
+$unexpanded = @($env:Path -split ';' | Where-Object { $_ -match '%[^%;]+%' })
+if ($newTerminalPathError) {
+    $pathResult.Status = 'Error'
+    $pathResult.Actual = "Couldn't build it"
+    $pathResult.Message = $newTerminalPathError
+} elseif ($unexpanded.Count) {
+    $pathResult.Actual = "Contains $($unexpanded -join ', ')"
+    $pathResult.Message = 'Windows doesn''t expand a variable inside PATH when that variable is itself an expandable string, so tools in those folders aren''t found.'
+} else {
+    $pathResult.Status = 'Pass'
+    $pathResult.Actual = "$(@($env:Path -split ';' | Where-Object { $_ }).Count) entries, all expanded"
+}
+Add-VerifyResult -Result $pathResult
 
 $phaseIndex = 0
 foreach ($phase in $phases) {
