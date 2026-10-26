@@ -1954,6 +1954,12 @@ public static class DevConfigVerifyNative
     // Width 0 keeps the current size, for fixed-size dialogs.
     public static void Arrange(IntPtr hWnd, int widthDip, int heightDip)
     {
+        Arrange(hWnd, widthDip, heightDip, -1);
+    }
+
+    // topDip places the window that far below the top of the work area; -1 keeps its current position.
+    public static void Arrange(IntPtr hWnd, int widthDip, int heightDip, int topDip)
+    {
         IntPtr previous = SetThreadDpiAwarenessContext(PerMonitorAwareV2);
         try
         {
@@ -1966,12 +1972,13 @@ public static class DevConfigVerifyNative
                 RECT work = info.rcWork;
                 double scale = GetDpiForWindow(hWnd) / 96.0;
                 if (scale <= 0) { scale = 1; }
+                int top = topDip >= 0 ? Math.Min(work.Top + (int)(topDip * scale), work.Bottom - 200) : work.Top;
                 int width = Math.Min((int)(widthDip * scale), work.Right - work.Left);
-                int height = heightDip > 0 ? Math.Min((int)(heightDip * scale), work.Bottom - work.Top) : work.Bottom - work.Top;
+                int height = heightDip > 0 ? Math.Min((int)(heightDip * scale), work.Bottom - top) : work.Bottom - top;
                 RECT current;
                 GetWindowRect(hWnd, out current);
                 int x = Math.Max(work.Left, Math.Min(current.Left, work.Right - width));
-                int y = heightDip > 0 ? Math.Max(work.Top, Math.Min(current.Top, work.Bottom - height)) : work.Top;
+                int y = topDip >= 0 ? top : heightDip > 0 ? Math.Max(work.Top, Math.Min(current.Top, work.Bottom - height)) : work.Top;
                 SetWindowPos(hWnd, IntPtr.Zero, x, y, width, height, 0x0004);
             }
             SetForegroundWindow(hWnd);
@@ -1980,6 +1987,20 @@ public static class DevConfigVerifyNative
         {
             SetThreadDpiAwarenessContext(previous);
         }
+    }
+
+    // Raises a window above others without activating it; a background process can't take the foreground.
+    public static void SetTopMost(IntPtr hWnd, bool topMost)
+    {
+        SetWindowPos(hWnd, new IntPtr(topMost ? -1 : -2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+    }
+
+    [DllImport("kernel32.dll")] private static extern uint SetThreadExecutionState(uint flags);
+
+    // Resets the display idle timer for as long as it's on, without sending any input.
+    public static void KeepDisplayOn(bool on)
+    {
+        SetThreadExecutionState(on ? 0x80000003u : 0x80000000u);
     }
 
     // Returns an HBITMAP of the visible frame; the caller deletes it.
@@ -2277,6 +2298,8 @@ function Save-VerifyTerminalWindow {
     $handle = Wait-VerifyNewWindow -ClassName $className -Existing $existing
     $files = @()
     try {
+        # Windows started from a background process open behind others, and screen captures need it in front.
+        [DevConfigVerifyNative]::SetTopMost($handle, $true)
         [DevConfigVerifyNative]::Arrange($handle, 1000, 460)
         Start-Sleep -Seconds 6
         $name = "$Id-1.png"
@@ -2284,8 +2307,9 @@ function Save-VerifyTerminalWindow {
         $files += $name
 
         try {
+            # The button's tooltip opens above it when there's room, and below it, over the menu, when there isn't.
             # Taller, so a long profile list fits inside the window.
-            [DevConfigVerifyNative]::Arrange($handle, 1000, 680)
+            [DevConfigVerifyNative]::Arrange($handle, 1000, 680, 120)
             Start-Sleep -Seconds 1
             $menu = Open-VerifyTerminalNewTabMenu -Handle $handle
             if ($menu) {
@@ -2629,6 +2653,16 @@ $Script:DevConfigWorkload = $Workload
 $Script:DevConfigResumed = $false
 $Script:DevConfigAllowUnsigned = $true
 
+# A run takes longer than a typical display timeout, and Terminal stops drawing while the display is off.
+if (-not $NoScreenshots) {
+    try {
+        if (-not ('DevConfigVerifyNative' -as [type])) { Add-Type -TypeDefinition $nativeSource }
+        [DevConfigVerifyNative]::KeepDisplayOn($true)
+    } catch {
+        Write-Verbose "Could not keep the display on: $($_.Exception.Message)"
+    }
+}
+
 Write-Host ''
 Write-Host "Verifying $($definition['Name']) ($Experience experience, -Action $Action)" -ForegroundColor Cyan
 Write-Host "  Definitions: $ConfigSource" -ForegroundColor DarkGray
@@ -2706,6 +2740,8 @@ if (-not $NoScreenshots) {
         $panels = Invoke-VerifyScreenshots
     } catch {
         Write-Host "  Screenshots skipped: $($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        if ('DevConfigVerifyNative' -as [type]) { [DevConfigVerifyNative]::KeepDisplayOn($false) }
     }
 }
 

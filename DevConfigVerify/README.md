@@ -72,7 +72,7 @@ Each step gets one of three results:
   - A new Windows Terminal window, showing the default profile, prompt, and font. A second capture opens Terminal's new-tab menu so each profile's icon is visible, such as Ubuntu's and GitHub Copilot's. The menu is captured from the screen, so it's skipped while the screen is locked.
   - File Explorer, plus the Folder Options General and View tabs.
 
-  It closes every window it opened. Folder Options is closed without applying anything.
+  It closes every window it opened. Folder Options is closed without applying anything. While it runs, it keeps the display from turning off, because apps such as Terminal stop drawing when the display is off. It never moves the mouse or types.
 - **Baseline.** `-Baseline` puts a previous run's results and screenshots beside the current ones and flags every check whose status changed. A clean-VM run makes a good golden baseline.
 
 ## PowerToys smoke test
