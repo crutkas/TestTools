@@ -38,7 +38,7 @@ Each step gets one of three results:
 | Result | Meaning |
 | --- | --- |
 | Pass | Matches setup's own definition. Available updates are noted but don't count against it. |
-| Set up differently | The outcome is in place but wasn't produced the way setup would, so a setup re-run would redo or flag it. Examples: a tool that works but wasn't installed through WinGet, or Oh My Posh started from your own profile line. |
+| Set up differently | The outcome is in place but wasn't produced the way setup would, so a setup re-run would redo or flag it. Examples: a tool that works but wasn't installed through WinGet, Oh My Posh started from your own profile line, or a WinGet that works but is older than setup's pinned release. |
 | Fail | Missing. |
 
 ## How it works
@@ -49,13 +49,30 @@ Each step gets one of three results:
   - Packages show the version WinGet reports.
   - Other steps show setup's own pass/fail check.
 - **Functional probes.** Every package is also probed directly, for example with `uv --version`, by looking up its MSIX registration, by reading the VC++ runtime key, or by searching installed programs. Tools installed outside WinGet are recognized, and versions still appear when only `winget.exe` is available. When setup's exact check fails for the Oh My Posh profile or the Copilot Terminal profile, the script also looks for the same outcome reached another way.
+- **WinGet.** A WinGet that runs but is older than setup's pinned release is reported as set up differently, with an update available, rather than as a failure. A WinGet that's missing or doesn't report a version still fails.
 - **Copilot plugins.** The marketplace step passes when `copilot plugin marketplace list` shows `win-dev-skills` or `awesome-copilot`. The WinUI plugin step passes for `winui@win-dev-skills` or `winui@awesome-copilot`. Older setups used awesome-copilot.
+
+  When `copilot plugin list` doesn't show the plugin, the script reads Copilot's user `settings.json` (in `%COPILOT_HOME%`, or `%USERPROFILE%\.copilot`). Copilot installs plugins listed there the next time it starts interactively, so this is expected:
+
+  ```json
+  {
+    "enabledPlugins": {
+      "winui@awesome-copilot": true
+    }
+  }
+  ```
+
+  An entry like that is reported as set up differently. The step fails, with the reason, when the file isn't valid JSON (curly quotes from a pasted snippet are called out), when `enabledPlugins` isn't an object, or when the WinUI entry isn't the JSON value `true` or names another marketplace.
+- **Windows Terminal profiles.** These checks read what Terminal itself layers together: `settings.json`, `profiles.defaults`, and every fragment folder.
+  - *Default profile.* Terminal reads `defaultProfile` as a GUID, then as an exact profile name, and opens its first profile when neither matches. The PowerShell 7 default step passes only when that resolves to a PowerShell 7 profile, and shows which profile actually opens.
+  - *Ubuntu icon.* Current WSL writes a Terminal fragment for each distro with the distro's own icon. Without one, Terminal shows its built-in WSL profile with a generic Linux (Tux) icon. The check fails for the generic icon, a missing or unreadable icon file, a hidden profile, or WSL profiles turned off in `disabledProfileSources`.
+  - *GitHub Copilot icon.* Setup writes the Copilot profile without an icon when it can't download the GitHub icon, and still counts that step as done. This check fails when the icon is missing, isn't an image (for example, a saved error page), or is overridden, and explains how to get setup to write it again.
 - **Visual check.** The script captures these windows right after the checks, so both describe the same moment:
   - The relevant Settings pages, with collapsed sections expanded and long pages captured screen by screen.
-  - A new Windows Terminal window, showing the default profile, prompt, and font.
+  - A new Windows Terminal window, showing the default profile, prompt, and font. A second capture opens Terminal's new-tab menu so each profile's icon is visible, such as Ubuntu's and GitHub Copilot's. The menu is captured from the screen, so it's skipped while the screen is locked.
   - File Explorer, plus the Folder Options General and View tabs.
 
-  It closes every window it opened. Folder Options is closed without applying anything.
+  It closes every window it opened. Folder Options is closed without applying anything. While it runs, it keeps the display from turning off, because apps such as Terminal stop drawing when the display is off. It never moves the mouse or types.
 - **Baseline.** `-Baseline` puts a previous run's results and screenshots beside the current ones and flags every check whose status changed. A clean-VM run makes a good golden baseline.
 
 ## PowerToys smoke test

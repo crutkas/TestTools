@@ -8,7 +8,8 @@
   therefore always match what setup itself considers "done".
 
   Unless -NoScreenshots is set, it also opens the related Settings pages, a Windows Terminal
-  window, and a File Explorer window, captures them, and closes the windows it opened.
+  window (also with its new-tab menu open, to show profile icons), and a File Explorer window,
+  captures them, and closes the windows it opened.
 
   Output: report.html (self-contained), results.json, and screenshots\ in -OutputPath.
   Each step is Pass (matches setup's definition), Set up differently (the outcome is there but
@@ -79,7 +80,7 @@ try {
     Write-Verbose "Could not force UTF-8 console encoding: $($_.Exception.Message)"
 }
 
-$VerifyToolVersion = '1.6.0'
+$VerifyToolVersion = '1.7.0'
 
 if ($Workload -ne 'devconfig' -and -not $PSBoundParameters.ContainsKey('Experience')) {
     $Experience = 'Full'
@@ -303,6 +304,8 @@ $Script:VerifyCheckOverrides = @{
     }
     WinSkillsMarketplace = { @(Get-VerifyAcceptedMarketplace).Count -gt 0 }
     WinUIPlugin          = { @(Get-VerifyWinUIPlugin | Where-Object { $_.Accepted }).Count -gt 0 }
+    # Setup's check accepts a profile name that Terminal may not resolve, so this also asks what Terminal actually opens.
+    Ps7DefaultProfile    = { [bool](Test-DevConfigPs7DefaultProfile) -and (Resolve-VerifyTerminalDefaultProfile).IsPwsh }
 }
 
 # Optional expected/actual text for steps whose Check only returns true or false.
@@ -335,6 +338,13 @@ $Script:VerifyDetails = @{
         $plugins = @(Get-VerifyWinUIPlugin)
         $actual = if ($plugins.Count) { "Installed: $(@($plugins | ForEach-Object { $_.Id }) -join ', ')" } else { 'Not installed' }
         @{ Expected = "winui from $($Script:VerifyAcceptedMarketplaces -join ' or ')"; Actual = $actual }
+    }
+    Ps7DefaultProfile = {
+        param($Ok)
+        $default = Resolve-VerifyTerminalDefaultProfile
+        $values = @{ Expected = 'New tabs open PowerShell 7'; Actual = $default.Actual }
+        if (-not $Ok) { $values.Message = $default.Message }
+        $values
     }
 }
 
@@ -370,7 +380,49 @@ $Script:VerifyAlternates = @{
                 Message = "It comes from a marketplace other than $($Script:VerifyAcceptedMarketplaces -join ' or ')."
             }
         }
+        # A hand-edited settings.json can enable the plugin before Copilot has installed it.
+        $settings = Get-VerifyCopilotSettingsPlugin
+        if (-not $settings) { return $null }
+        if ($settings.Error) {
+            return @{ Status = 'Fail'; Actual = "Copilot's settings.json isn't valid"; Message = "$($settings.Path): $($settings.Error)" }
+        }
+        $ready = @($settings.Plugins | Where-Object { $_.Enabled -and $_.Accepted })
+        if ($ready.Count) {
+            return @{
+                Actual  = "Enabled in settings.json: $(@($ready | ForEach-Object { $_.Id }) -join ', ')"
+                Message = "copilot plugin list doesn't show it yet. Copilot installs plugins listed in enabledPlugins the next time it starts interactively."
+            }
+        }
+        $listed = @($settings.Plugins) | Select-Object -First 1
+        if ($listed) {
+            $reason = if (-not $listed.Accepted) { "its marketplace isn't $($Script:VerifyAcceptedMarketplaces -join ' or ')" }
+                elseif ($listed.Value -is [string]) { "its value is the string ""$($listed.Value)"", not true" }
+                else { "its value is $(ConvertTo-Json -InputObject $listed.Value -Compress), not true" }
+            return @{
+                Status  = 'Fail'
+                Actual  = "settings.json lists $($listed.Id), but $reason"
+                Message = "Expected { ""enabledPlugins"": { ""winui@awesome-copilot"": true } } in $($settings.Path)."
+            }
+        }
         return $null
+    }
+    # An older WinGet still works, so it's reported without failing the run.
+    WinGet = {
+        $version = Get-DevConfigWinGetVersion -CliOnly
+        if (-not $version) { return $null }
+        return @{
+            Actual          = "winget $version"
+            Message         = "WinGet works but is older than the pinned $Script:DevConfigWinGetTargetVersion. Setup would update it; updating App Installer from the Microsoft Store also works."
+            UpdateAvailable = $true
+        }
+    }
+    Ps7DefaultProfile = {
+        $default = Resolve-VerifyTerminalDefaultProfile
+        if (-not $default.IsPwsh) { return $null }
+        return @{
+            Actual  = $default.Actual
+            Message = "PowerShell 7 opens by default, but through a profile setup doesn't manage, so setup would point defaultProfile at its own PowerShell profile."
+        }
     }
     GitHubCopilotProfile = {
         $paths = @(
@@ -463,6 +515,47 @@ function Get-VerifyWinUIPlugin {
     foreach ($match in [regex]::Matches($text, '(?i)(?<![\w-])winui@([\w.-]+)')) {
         [pscustomobject]@{ Id = $match.Value; Accepted = $Script:VerifyAcceptedMarketplaces -contains $match.Groups[1].Value }
     }
+}
+
+# winui@<marketplace> entries in enabledPlugins of Copilot's user settings.json, or why the file can't be used.
+# Returns nothing when there is no settings.json.
+function Get-VerifyCopilotSettingsPlugin {
+    $directory = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $env:USERPROFILE '.copilot' }
+    $path = Join-Path $directory 'settings.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+
+    $state = [pscustomobject]@{ Path = $path; Error = ''; Plugins = @() }
+    $text = [IO.File]::ReadAllText($path)
+    if ([string]::IsNullOrWhiteSpace($text)) { return $state }
+    try {
+        $settings = $text | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        $state.Error = "It isn't valid JSON: $($_.Exception.Message)"
+        # Snippets pasted from documents often carry curly quotes.
+        if ($text -match '[\u201C\u201D\u2018\u2019]') { $state.Error += ' It contains curly quotes; JSON needs straight quotes (").' }
+        return $state
+    }
+    if ($settings -isnot [System.Management.Automation.PSCustomObject]) {
+        $state.Error = 'It must hold a JSON object ({ ... }).'
+        return $state
+    }
+    $enabled = $settings.PSObject.Properties['enabledPlugins']
+    if (-not $enabled) { return $state }
+    if ($enabled.Value -isnot [System.Management.Automation.PSCustomObject]) {
+        $state.Error = 'enabledPlugins must be an object that maps "plugin@marketplace" to true, such as { "winui@awesome-copilot": true }.'
+        return $state
+    }
+    $state.Plugins = @(foreach ($property in $enabled.Value.PSObject.Properties) {
+        if ($property.Name -match '^winui@([\w.-]+)$') {
+            [pscustomobject]@{
+                Id       = $property.Name
+                Value    = $property.Value
+                Enabled  = ($property.Value -is [bool] -and $property.Value)
+                Accepted = $Script:VerifyAcceptedMarketplaces -contains $Matches[1]
+            }
+        }
+    })
+    return $state
 }
 
 function Find-VerifyUninstallEntry {
@@ -700,9 +793,11 @@ function Test-VerifyStep {
                 try {
                     $found = & $alternate
                     if ($found) {
-                        $result.Status = 'Warn'
+                        # Alternates are "set up differently" unless they say otherwise, such as invalid settings.
+                        $result.Status = if ($found.ContainsKey('Status')) { $found.Status } else { 'Warn' }
                         $result.Actual = $found.Actual
                         $result.Message = $found.Message
+                        if ($found.ContainsKey('UpdateAvailable')) { $result.UpdateAvailable = [bool]$found.UpdateAvailable }
                     }
                 } catch {
                     Write-Verbose "Could not look for another setup of $($Step.Name): $($_.Exception.Message)"
@@ -739,6 +834,426 @@ function Add-VerifyResult {
     }
     if ($Result.Message) {
         Write-Host ('    {0}' -f $Result.Message) -ForegroundColor DarkGray
+    }
+}
+
+#endregion
+
+#region Windows Terminal profiles
+# Setup's checks confirm the files it wrote; these confirm what Terminal's new-tab menu actually shows.
+
+# Terminal's built-in WSL profiles use this generic Linux (Tux) icon.
+$Script:VerifyWslGenericIcon = 'ms-appx:///ProfileIcons/{9acb9455-ca41-5af7-950f-6bca1bc9722f}.png'
+# Namespace of the GUIDs Terminal gives its built-in WSL, PowerShell, and Azure profiles.
+$Script:VerifyTerminalProfileNamespace = [guid]'2bde4a90-d05f-401c-9492-e40884ead1d8'
+
+function ConvertTo-VerifyGuidKey {
+    param([AllowNull()] $Value)
+    $guid = [guid]::Empty
+    if ($Value -and [guid]::TryParse([string]$Value, [ref]$guid)) { return $guid.ToString('B') }
+    return $null
+}
+
+# RFC 4122 name-based GUID, as Terminal derives profile GUIDs from a name (UTF-16).
+function New-VerifyNameGuid {
+    param([guid] $Namespace, [string] $Name)
+    $ns = $Namespace.ToByteArray()
+    # .NET stores the first three fields little-endian; the hash uses network order.
+    [Array]::Reverse($ns, 0, 4); [Array]::Reverse($ns, 4, 2); [Array]::Reverse($ns, 6, 2)
+    $sha1 = [Security.Cryptography.SHA1]::Create()
+    try {
+        $hash = $sha1.ComputeHash([byte[]]($ns + [Text.Encoding]::Unicode.GetBytes($Name)))
+    } finally {
+        $sha1.Dispose()
+    }
+    $bytes = [byte[]]$hash[0..15]
+    $bytes[6] = ($bytes[6] -band 0x0F) -bor 0x50
+    $bytes[8] = ($bytes[8] -band 0x3F) -bor 0x80
+    [Array]::Reverse($bytes, 0, 4); [Array]::Reverse($bytes, 4, 2); [Array]::Reverse($bytes, 6, 2)
+    return ([guid]::new($bytes)).ToString('B')
+}
+
+# Every profile in one fragment folder, tagged with the source name Terminal files it under.
+function Get-VerifyFragmentProfile {
+    param([string] $Directory, [string] $Source)
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return }
+    foreach ($file in Get-ChildItem -LiteralPath $Directory -Filter '*.json' -File -ErrorAction SilentlyContinue) {
+        try {
+            # Accepts the comments and trailing commas Terminal allows.
+            $fragment = Read-DevConfigTerminalSettings -Path $file.FullName
+        } catch {
+            Write-Verbose "Skipping unreadable Terminal fragment $($file.FullName)"
+            continue
+        }
+        foreach ($entry in @(Get-DevConfigJsonValue -Object $fragment -Path 'profiles')) {
+            if ($null -eq $entry) { continue }
+            [pscustomobject]@{
+                Source      = $Source
+                File        = $file.FullName
+                Guid        = ConvertTo-VerifyGuidKey -Value (Get-DevConfigJsonValue -Object $entry -Path 'guid')
+                Updates     = ConvertTo-VerifyGuidKey -Value (Get-DevConfigJsonValue -Object $entry -Path 'updates')
+                Name        = [string](Get-DevConfigJsonValue -Object $entry -Path 'name')
+                Icon        = [string](Get-DevConfigJsonValue -Object $entry -Path 'icon')
+                Hidden      = Get-DevConfigJsonValue -Object $entry -Path 'hidden'
+                Commandline = [string](Get-DevConfigJsonValue -Object $entry -Path 'commandline')
+            }
+        }
+    }
+}
+
+# Fragments an MSIX package publishes through Terminal's settings app extension.
+function Get-VerifyPackageFragmentProfile {
+    param([string] $FamilyName)
+    if (-not $FamilyName) { return }
+    $package = Get-AppxPackage -Name ($FamilyName -split '_')[0] -ErrorAction SilentlyContinue |
+        Where-Object { $_.PackageFamilyName -eq $FamilyName } | Select-Object -First 1
+    if (-not $package -or -not $package.InstallLocation) { return }
+    [xml]$manifest = [IO.File]::ReadAllText((Join-Path $package.InstallLocation 'AppxManifest.xml'))
+    foreach ($extension in $manifest.SelectNodes('//*[local-name()="AppExtension"][@Name="com.microsoft.windows.terminal.settings"]')) {
+        $public = $extension.GetAttribute('PublicFolder')
+        if ($public) {
+            Get-VerifyFragmentProfile -Directory (Join-Path (Join-Path $package.InstallLocation $public) 'Fragments') -Source $FamilyName
+        }
+    }
+}
+
+# What Terminal layers into its profiles: settings.json plus every fragment folder.
+function Get-VerifyTerminalState {
+    $path = Get-DevConfigTerminalSettingsPath
+    $settings = if ($path) { Read-DevConfigTerminalSettings -Path $path } else { [pscustomobject]@{} }
+    $profilesNode = Get-DevConfigJsonValue -Object $settings -Path 'profiles'
+    # Older settings files hold the profile list directly under "profiles".
+    $list = if ($profilesNode -is [array]) { $profilesNode } else { Get-DevConfigJsonValue -Object $settings -Path 'profiles', 'list' }
+    $fragments = foreach ($base in @($env:LOCALAPPDATA, $env:ProgramData)) {
+        $root = Join-Path $base 'Microsoft\Windows Terminal\Fragments'
+        if (Test-Path -LiteralPath $root -PathType Container) {
+            foreach ($folder in Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue) {
+                Get-VerifyFragmentProfile -Directory $folder.FullName -Source $folder.Name
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Path      = $path
+        Settings  = $settings
+        List      = @($list | Where-Object { $null -ne $_ })
+        Defaults  = Get-DevConfigJsonValue -Object $settings -Path 'profiles', 'defaults'
+        Disabled  = @(Get-DevConfigJsonValue -Object $settings -Path 'disabledProfileSources' | Where-Object { $_ })
+        Fragments = @($fragments)
+    }
+}
+
+# Terminal layers a profile as: its settings.json entry, profiles.defaults, fragment "updates", then the profile itself.
+function Resolve-VerifyTerminalProfile {
+    param(
+        [Parameter(Mandatory)] $State,
+        [Parameter(Mandatory)] [string] $Guid,
+        [AllowNull()] $Base,
+        [string] $BaseIcon = '',
+        [string] $BaseFrom = '',
+        [object[]] $Updates = @()
+    )
+    $entry = @($State.List | Where-Object { (ConvertTo-VerifyGuidKey -Value (Get-DevConfigJsonValue -Object $_ -Path 'guid')) -eq $Guid }) | Select-Object -First 1
+    $layers = [System.Collections.Generic.List[object]]::new()
+    if ($entry) {
+        $layers.Add([pscustomobject]@{ Icon = [string](Get-DevConfigJsonValue -Object $entry -Path 'icon'); Hidden = Get-DevConfigJsonValue -Object $entry -Path 'hidden'; From = 'its entry in Terminal settings'; Directory = '' })
+    }
+    if ($State.Defaults) {
+        $layers.Add([pscustomobject]@{ Icon = [string](Get-DevConfigJsonValue -Object $State.Defaults -Path 'icon'); Hidden = $null; From = 'profiles.defaults in Terminal settings'; Directory = '' })
+    }
+    # A later fragment takes precedence over an earlier one.
+    $fragmentUpdates = @(@($State.Fragments) + @($Updates) | Where-Object { $_ -and $_.Updates -eq $Guid -and $State.Disabled -notcontains $_.Source })
+    [array]::Reverse($fragmentUpdates)
+    foreach ($update in $fragmentUpdates) {
+        $layers.Add([pscustomobject]@{ Icon = $update.Icon; Hidden = $update.Hidden; From = "the $($update.Source) fragment"; Directory = (Split-Path -Parent $update.File) })
+    }
+    if ($Base) {
+        $layers.Add([pscustomobject]@{ Icon = $Base.Icon; Hidden = $Base.Hidden; From = "the $($Base.Source) fragment"; Directory = (Split-Path -Parent $Base.File) })
+    } else {
+        $layers.Add([pscustomobject]@{ Icon = $BaseIcon; Hidden = $null; From = $BaseFrom; Directory = '' })
+    }
+    $iconLayer = $layers | Where-Object { $_.Icon } | Select-Object -First 1
+    $hiddenLayer = $layers | Where-Object { $null -ne $_.Hidden } | Select-Object -First 1
+    return [pscustomobject]@{
+        Icon      = $(if ($iconLayer) { $iconLayer.Icon } else { '' })
+        From      = $(if ($iconLayer) { $iconLayer.From } else { $layers[$layers.Count - 1].From })
+        Directory = $(if ($iconLayer) { $iconLayer.Directory } else { '' })
+        Hidden    = [bool]($hiddenLayer -and $hiddenLayer.Hidden)
+    }
+}
+
+# Returns why Terminal can't show an icon, or nothing when it can.
+function Test-VerifyIconSource {
+    param([string] $Icon, [string] $Directory)
+    if (-not $Icon) { return 'No icon is set, so Terminal shows a generic one' }
+    if ($Icon -eq 'none') { return 'Its icon is turned off ("none")' }
+    if ($Icon -match '^(ms-appx|ms-appdata|https?):') { return }
+    $path = [Environment]::ExpandEnvironmentVariables($Icon) -replace ',\s*-?\d+$', ''
+    # A short value with no path characters is an emoji or glyph.
+    if ($path.Length -le 4 -and $path -notmatch '[\\/.:]') { return }
+    if (-not [IO.Path]::IsPathRooted($path)) {
+        if (-not $Directory) { return "Its icon isn't a full path: $Icon" }
+        $path = Join-Path $Directory $path
+    }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "Its icon file is missing: $path" }
+    if ([IO.Path]::GetExtension($path) -match '^\.(exe|dll|svg)$') { return }
+    $header = [byte[]]::new(12)
+    $stream = [IO.File]::OpenRead($path)
+    try { $read = $stream.Read($header, 0, $header.Length) } finally { $stream.Dispose() }
+    if ($read -eq 0) { return "Its icon file is empty: $path" }
+    $hex = -join ($header[0..($read - 1)] | ForEach-Object { $_.ToString('X2') })
+    # PNG, ICO, JPEG, GIF, BMP, or WebP.
+    if ($hex -match '^(89504E47|00000100|FFD8FF|47494638|424D)' -or $hex -match '^52494646[0-9A-F]{8}57454250') { return }
+    return "Its icon file isn't an image (a failed download can save an error page instead): $path"
+}
+
+function Test-VerifyPwshProfile {
+    param($Candidate)
+    if ($Candidate.Source -eq 'Windows.Terminal.PowershellCore') { return $true }
+    $commandline = [Environment]::ExpandEnvironmentVariables([string]$Candidate.Commandline).Trim()
+    if ($commandline -notmatch '^"?(?:[^"]*[\\/])?pwsh(?:\.exe)?"?(?=\s|$)') { return $false }
+    # A pwsh command line that runs something else, such as the Copilot profile, isn't a PowerShell 7 shell.
+    return $commandline -notmatch '\s-(?:c|command|f|file|e|ec|encodedcommand)(?=\s|$)'
+}
+
+# Terminal reads defaultProfile as a GUID, then as an exact profile name; when neither matches, it opens the first profile.
+function Resolve-VerifyTerminalDefaultProfile {
+    $outcome = [pscustomobject]@{ IsPwsh = $false; Actual = ''; Message = '' }
+    $state = Get-VerifyTerminalState
+    if (-not $state.Path) {
+        $outcome.Actual = if (Get-DevConfigTerminalSettingsTarget) { "Terminal hasn't saved its settings yet" } else { "Windows Terminal isn't installed" }
+        return $outcome
+    }
+
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $state.List) {
+        $guid = ConvertTo-VerifyGuidKey -Value (Get-DevConfigJsonValue -Object $entry -Path 'guid')
+        $commandline = [string](Get-DevConfigJsonValue -Object $entry -Path 'commandline')
+        if (-not $commandline -and $guid) {
+            # Fragment profiles keep their command line in the fragment, not in settings.json.
+            $fragment = $state.Fragments | Where-Object { $_.Guid -eq $guid -and $_.Commandline } | Select-Object -First 1
+            if ($fragment) { $commandline = $fragment.Commandline }
+        }
+        $candidates.Add([pscustomobject]@{
+            Guid        = $guid
+            Name        = [string](Get-DevConfigJsonValue -Object $entry -Path 'name')
+            Source      = [string](Get-DevConfigJsonValue -Object $entry -Path 'source')
+            Commandline = $commandline
+        })
+    }
+    $known = @($candidates | ForEach-Object { $_.Guid })
+    foreach ($fragment in $state.Fragments) {
+        if ($fragment.Guid -and $fragment.Name -and $known -notcontains $fragment.Guid -and $state.Disabled -notcontains $fragment.Source) {
+            $candidates.Add([pscustomobject]@{ Guid = $fragment.Guid; Name = $fragment.Name; Source = $fragment.Source; Commandline = $fragment.Commandline })
+        }
+    }
+
+    $value = [string](Get-DevConfigJsonValue -Object $state.Settings -Path 'defaultProfile')
+    $match = $null
+    if ($value) {
+        $key = if ($value.Length -eq 38 -and $value.StartsWith('{')) { ConvertTo-VerifyGuidKey -Value $value } else { $null }
+        if ($key) { $match = $candidates | Where-Object { $_.Guid -eq $key } | Select-Object -First 1 }
+        if (-not $match) { $match = $candidates | Where-Object { $_.Name -ceq $value } | Select-Object -First 1 }
+    }
+    if (-not $match) {
+        # Terminal generates its PowerShell 7 profile, named as setup expects, the next time it loads.
+        $generated = @($candidates | Where-Object { $_.Source -eq 'Windows.Terminal.PowershellCore' })
+        if ($value -ceq $Script:DevConfigPs7ProfileName -and $generated.Count -eq 0 -and (Get-Command -Name pwsh.exe -ErrorAction SilentlyContinue)) {
+            $outcome.IsPwsh = $true
+            $outcome.Actual = "'$value' (PowerShell 7, which Terminal lists the next time it starts)"
+            return $outcome
+        }
+        # Terminal lists its own profiles before fragments, so with no saved list the first profile isn't known.
+        if ($state.List.Count -eq 0) {
+            $outcome.Actual = if ($value) { "defaultProfile is '$value'; Terminal hasn't listed its profiles yet" } else { "defaultProfile isn't set" }
+            $outcome.Message = 'Open Windows Terminal once so it lists its profiles, then run this again.'
+            return $outcome
+        }
+    }
+
+    $opened = if ($match) { $match } else { $candidates[0] }
+    $outcome.IsPwsh = Test-VerifyPwshProfile -Candidate $opened
+    $outcome.Actual = "'$($opened.Name)'$(if ($outcome.IsPwsh) { ' (PowerShell 7)' })"
+    if (-not $match) {
+        $outcome.Message = if ($value) {
+            "defaultProfile is '$value', which matches no profile by GUID or exact name, so Terminal opens its first profile."
+        } else {
+            "defaultProfile isn't set, so Terminal opens its first profile."
+        }
+    } elseif (-not $outcome.IsPwsh) {
+        $outcome.Message = "defaultProfile points at '$($opened.Name)', which isn't PowerShell 7."
+    }
+    return $outcome
+}
+
+function Get-VerifyUbuntuRegistration {
+    $name = 'Ubuntu'
+    $configured = Get-Variable -Name DevConfigWslDistributionName -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($configured) { $name = $configured }
+    $root = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    if (-not (Test-Path -LiteralPath $root)) { return $null }
+    $found = foreach ($key in Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue) {
+        $distribution = [string]$key.GetValue('DistributionName')
+        if ($distribution -like "$name*") {
+            [pscustomobject]@{
+                Name                = $distribution
+                Modern              = [int]$key.GetValue('Modern', 0) -eq 1
+                TerminalProfilePath = [string]$key.GetValue('TerminalProfilePath')
+                PackageFamilyName   = [string]$key.GetValue('PackageFamilyName')
+            }
+        }
+    }
+    # The exact name setup installs comes first, then versioned ones such as Ubuntu-24.04.
+    return @($found | Sort-Object { $_.Name -ne $name }) | Select-Object -First 1
+}
+
+# Ubuntu's own icon comes from a fragment: current WSL writes one per distro, and the Store package ships one for
+# older registrations. Without either, Terminal shows its built-in WSL profile with the generic Linux icon.
+function Test-VerifyTerminalUbuntuIcon {
+    param($State, $Result)
+    $distro = Get-VerifyUbuntuRegistration
+    if (-not $distro) {
+        $Result.Status = 'Skip'
+        $Result.Actual = "Ubuntu isn't installed"
+        return
+    }
+    $Result.Detail = $distro.Name
+
+    if ($distro.Modern) {
+        if ($State.Disabled -contains 'Microsoft.WSL') {
+            $Result.Actual = "Terminal ignores WSL's profiles"
+            $Result.Message = 'disabledProfileSources in Terminal settings lists Microsoft.WSL, so Ubuntu has no profile of its own.'
+            return
+        }
+        $base = if ($distro.TerminalProfilePath) {
+            $State.Fragments | Where-Object { $_.File -eq $distro.TerminalProfilePath -and $_.Guid } | Select-Object -First 1
+        }
+        if (-not $base) {
+            $Result.Actual = 'No Ubuntu profile from WSL'
+            $Result.Message = if (-not $distro.TerminalProfilePath) {
+                "WSL didn't record a Terminal profile when it registered $($distro.Name), so there's no profile with Ubuntu's icon."
+            } elseif (Test-Path -LiteralPath $distro.TerminalProfilePath) {
+                "WSL's Terminal profile for $($distro.Name) has no readable profile: $($distro.TerminalProfilePath)"
+            } else {
+                "WSL's Terminal profile for $($distro.Name) is missing: $($distro.TerminalProfilePath)"
+            }
+            return
+        }
+        $resolved = Resolve-VerifyTerminalProfile -State $State -Guid $base.Guid -Base $base
+    } else {
+        if ($State.Disabled -contains 'Windows.Terminal.Wsl') {
+            $Result.Actual = "Terminal's WSL profiles are turned off"
+            $Result.Message = 'disabledProfileSources in Terminal settings lists Windows.Terminal.Wsl, so Ubuntu has no profile.'
+            return
+        }
+        $guid = New-VerifyNameGuid -Namespace $Script:VerifyTerminalProfileNamespace -Name $distro.Name
+        $packageUpdates = @()
+        if ($distro.PackageFamilyName -and $State.Disabled -notcontains $distro.PackageFamilyName) {
+            $packageUpdates = @(Get-VerifyPackageFragmentProfile -FamilyName $distro.PackageFamilyName)
+        }
+        $resolved = Resolve-VerifyTerminalProfile -State $State -Guid $guid -Base $null `
+            -BaseIcon $Script:VerifyWslGenericIcon -BaseFrom "Terminal's built-in WSL profile" -Updates $packageUpdates
+    }
+
+    if ($resolved.Hidden) {
+        $Result.Actual = 'Hidden in Terminal'
+        $Result.Message = "Ubuntu's profile is hidden, so it isn't in the new-tab menu."
+        return
+    }
+    if ($resolved.Icon -eq $Script:VerifyWslGenericIcon) {
+        $Result.Actual = 'Generic Linux icon'
+        $Result.Message = if ($resolved.From -like "Terminal's built-in*") {
+            "$($distro.Name) is an older WSL registration without its own Terminal profile$(if ($distro.PackageFamilyName) { ', and its Store package adds none' }), so Terminal falls back to its built-in WSL profile and generic Linux icon."
+        } else {
+            "The generic Linux icon is set by $($resolved.From)."
+        }
+        return
+    }
+    $problem = Test-VerifyIconSource -Icon $resolved.Icon -Directory $resolved.Directory
+    if ($problem) {
+        $Result.Actual = "Ubuntu's icon doesn't load"
+        $Result.Message = "$problem (from $($resolved.From))."
+        return
+    }
+    $Result.Status = 'Pass'
+    $Result.Actual = "Icon from $($resolved.From)"
+    $Result.Probe = $resolved.Icon
+}
+
+function Test-VerifyTerminalCopilotIcon {
+    param($State, $Result)
+    $fragmentDir = Get-DevConfigCopilotFragmentDir
+    $fragmentFile = Join-Path $fragmentDir 'github-copilot.fragment.json'
+    $guid = ConvertTo-VerifyGuidKey -Value $Script:CopilotFragmentGuid
+    $base = $State.Fragments | Where-Object { $_.Guid -eq $guid -and $_.File -eq $fragmentFile } | Select-Object -First 1
+    $ours = [bool]$base
+    if (-not $base) {
+        $guid = $null
+        # Another Copilot profile, from another fragment or added by hand, still shows in the menu.
+        $base = $State.Fragments | Where-Object { $_.Guid -and -not $_.Updates -and $_.Name -match 'copilot' } | Select-Object -First 1
+        if ($base) {
+            $guid = $base.Guid
+        } else {
+            $entry = $State.List | Where-Object {
+                [string](Get-DevConfigJsonValue -Object $_ -Path 'name') -match 'copilot' -and -not (Get-DevConfigJsonValue -Object $_ -Path 'source')
+            } | Select-Object -First 1
+            if ($entry) { $guid = ConvertTo-VerifyGuidKey -Value (Get-DevConfigJsonValue -Object $entry -Path 'guid') }
+        }
+    }
+    if (-not $guid) {
+        $Result.Status = 'Skip'
+        $Result.Actual = 'No GitHub Copilot profile'
+        return
+    }
+    if ($base) { $Result.Detail = $base.File }
+    if ($base -and $State.Disabled -contains $base.Source) {
+        $Result.Actual = "Terminal ignores the $($base.Source) fragment"
+        $Result.Message = "disabledProfileSources in Terminal settings lists $($base.Source), so the Copilot profile isn't in the menu."
+        return
+    }
+
+    $resolved = Resolve-VerifyTerminalProfile -State $State -Guid $guid -Base $base -BaseFrom 'its entry in Terminal settings'
+    if ($resolved.Hidden) {
+        $Result.Actual = 'Hidden in Terminal'
+        $Result.Message = "The GitHub Copilot profile is hidden, so it isn't in the new-tab menu."
+        return
+    }
+    $problem = Test-VerifyIconSource -Icon $resolved.Icon -Directory $resolved.Directory
+    if ($problem) {
+        $Result.Actual = if ($resolved.Icon) { "Copilot's icon doesn't load" } else { 'Generic icon' }
+        $Result.Message = "$problem (from $($resolved.From))."
+        if ($ours -and -not $resolved.Icon) {
+            # Setup's own check accepts a profile without an icon, so a re-run alone won't add one.
+            $Result.Message += " Setup writes the profile without an icon when it can't download github.githubassets.com/favicons/favicon-dark.png, and still counts the step as done. Delete $fragmentFile, then run setup again with github.githubassets.com reachable."
+        }
+        return
+    }
+    $Result.Status = 'Pass'
+    $Result.Actual = "Icon from $($resolved.From)"
+    $Result.Probe = $resolved.Icon
+}
+
+# Each check runs when the setup step that creates its profile is part of this run.
+function Invoke-VerifyTerminalProfileChecks {
+    param([string[]] $Steps)
+    $state = Get-VerifyTerminalState
+    $checks = @(
+        @{ Step = 'WslUbuntu'; Name = 'TerminalUbuntuIcon'; Title = 'Ubuntu profile shows the Ubuntu icon'; Expected = 'Ubuntu icon'; Test = 'Test-VerifyTerminalUbuntuIcon' }
+        @{ Step = 'GitHubCopilotProfile'; Name = 'TerminalCopilotIcon'; Title = 'GitHub Copilot profile shows the GitHub icon'; Expected = 'GitHub icon'; Test = 'Test-VerifyTerminalCopilotIcon' }
+    )
+    foreach ($check in $checks) {
+        if ($Steps -notcontains $check.Step) { continue }
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $result = New-VerifyResult -Name $check.Name -Title $check.Title
+        $result.Expected = $check.Expected
+        try {
+            & $check.Test -State $state -Result $result
+        } catch {
+            $result.Status = 'Error'
+            $result.Actual = "Couldn't check"
+            $result.Message = $_.Exception.Message
+        }
+        $result.Seconds = [math]::Round($timer.Elapsed.TotalSeconds, 1)
+        Add-VerifyResult -Result $result
     }
 }
 
@@ -1439,6 +1954,12 @@ public static class DevConfigVerifyNative
     // Width 0 keeps the current size, for fixed-size dialogs.
     public static void Arrange(IntPtr hWnd, int widthDip, int heightDip)
     {
+        Arrange(hWnd, widthDip, heightDip, -1);
+    }
+
+    // topDip places the window that far below the top of the work area; -1 keeps its current position.
+    public static void Arrange(IntPtr hWnd, int widthDip, int heightDip, int topDip)
+    {
         IntPtr previous = SetThreadDpiAwarenessContext(PerMonitorAwareV2);
         try
         {
@@ -1451,12 +1972,13 @@ public static class DevConfigVerifyNative
                 RECT work = info.rcWork;
                 double scale = GetDpiForWindow(hWnd) / 96.0;
                 if (scale <= 0) { scale = 1; }
+                int top = topDip >= 0 ? Math.Min(work.Top + (int)(topDip * scale), work.Bottom - 200) : work.Top;
                 int width = Math.Min((int)(widthDip * scale), work.Right - work.Left);
-                int height = heightDip > 0 ? Math.Min((int)(heightDip * scale), work.Bottom - work.Top) : work.Bottom - work.Top;
+                int height = heightDip > 0 ? Math.Min((int)(heightDip * scale), work.Bottom - top) : work.Bottom - top;
                 RECT current;
                 GetWindowRect(hWnd, out current);
                 int x = Math.Max(work.Left, Math.Min(current.Left, work.Right - width));
-                int y = heightDip > 0 ? Math.Max(work.Top, Math.Min(current.Top, work.Bottom - height)) : work.Top;
+                int y = topDip >= 0 ? top : heightDip > 0 ? Math.Max(work.Top, Math.Min(current.Top, work.Bottom - height)) : work.Top;
                 SetWindowPos(hWnd, IntPtr.Zero, x, y, width, height, 0x0004);
             }
             SetForegroundWindow(hWnd);
@@ -1465,6 +1987,20 @@ public static class DevConfigVerifyNative
         {
             SetThreadDpiAwarenessContext(previous);
         }
+    }
+
+    // Raises a window above others without activating it; a background process can't take the foreground.
+    public static void SetTopMost(IntPtr hWnd, bool topMost)
+    {
+        SetWindowPos(hWnd, new IntPtr(topMost ? -1 : -2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+    }
+
+    [DllImport("kernel32.dll")] private static extern uint SetThreadExecutionState(uint flags);
+
+    // Resets the display idle timer for as long as it's on, without sending any input.
+    public static void KeepDisplayOn(bool on)
+    {
+        SetThreadExecutionState(on ? 0x80000003u : 0x80000000u);
     }
 
     // Returns an HBITMAP of the visible frame; the caller deletes it.
@@ -1530,7 +2066,7 @@ $panelDefinitions = @(
     @{ Id = 'notifications'; Title = 'Notifications';      Kind = 'Settings'; Source = 'ms-settings:notifications';        Steps = @('DoNotDisturb', 'PowerToysAOT') }
     @{ Id = 'search';        Title = 'Search permissions'; Kind = 'Settings'; Source = 'ms-settings:search-permissions';   Steps = @('WebSearchOff', 'SearchHighlightOff') }
     @{ Id = 'remotedesktop'; Title = 'Remote Desktop';     Kind = 'Settings'; Source = 'ms-settings:remotedesktop';        Steps = @('RemoteDesktop') }
-    @{ Id = 'terminal';      Title = 'Windows Terminal';   Kind = 'Terminal'; Source = 'wt.exe -w new';                    Steps = @('Ps7DefaultProfile', 'CascadiaDefaultFont', 'OhMyPoshProfile', 'GitHubCopilotProfile') }
+    @{ Id = 'terminal';      Title = 'Windows Terminal';   Kind = 'Terminal'; Source = 'wt.exe -w new';                    Steps = @('Ps7DefaultProfile', 'CascadiaDefaultFont', 'OhMyPoshProfile', 'GitHubCopilotProfile', 'TerminalUbuntuIcon', 'TerminalCopilotIcon') }
     @{ Id = 'explorer';      Title = 'File Explorer';      Kind = 'Explorer'; Source = 'explorer.exe';                     Steps = @('OpenThisPC', 'ShowFileExtensions', 'DetailsContainer') }
     # Folder Options is stable across builds, unlike the Settings page that hosts these toggles.
     @{ Id = 'folderoptions-general'; Title = 'Folder Options: General'; Kind = 'Dialog'; Source = 'rundll32.exe shell32.dll,Options_RunDLL 0'; Steps = @('OpenThisPC', 'FrequentFolders', 'FrequentFiles', 'RecommendedFiles') }
@@ -1565,9 +2101,11 @@ function Test-VerifyBitmapBlank {
 }
 
 function Save-VerifyWindowImage {
-    param([IntPtr] $Handle, [string] $Path)
+    param([IntPtr] $Handle, [string] $Path, [switch] $ScreenOnly)
     # PrintWindow is tried first because it ignores overlapping windows; a blank result falls back to the screen.
-    foreach ($fromScreen in @($false, $true)) {
+    # Popups such as menus are separate from the window, so only a screen capture includes them.
+    $sources = if ($ScreenOnly) { @($true) } else { @($false, $true) }
+    foreach ($fromScreen in $sources) {
         $width = 0
         $height = 0
         $hbitmap = [DevConfigVerifyNative]::Capture($Handle, $fromScreen, [ref]$width, [ref]$height)
@@ -1579,6 +2117,10 @@ function Save-VerifyWindowImage {
         try {
             if (-not $fromScreen -and (Test-VerifyBitmapBlank -Bitmap $bitmap)) {
                 continue
+            }
+            # A locked screen captures as solid black.
+            if ($ScreenOnly -and (Test-VerifyBitmapBlank -Bitmap $bitmap)) {
+                throw 'The screen capture came back blank. Is the screen locked?'
             }
             $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
             return
@@ -1728,6 +2270,66 @@ function Save-VerifyNewWindow {
     }
 }
 
+# Opens Terminal's new-tab menu the way its dropdown arrow does. Returns the pattern to close it, or nothing.
+function Open-VerifyTerminalNewTabMenu {
+    param([IntPtr] $Handle)
+    if (-not $Script:VerifyUia) { return $null }
+    $element = [System.Windows.Automation.AutomationElement]
+    $condition = [System.Windows.Automation.PropertyCondition]::new($element::AutomationIdProperty, 'NewTabButton')
+    $button = $element::FromHandle($Handle).FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    if (-not $button) { throw "Terminal's new-tab button wasn't found." }
+    $pattern = $button.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    $pattern.Expand()
+    Start-Sleep -Milliseconds 1500
+    if ($pattern.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Expanded) {
+        throw "Terminal's new-tab menu didn't open."
+    }
+    return $pattern
+}
+
+# The first image shows the default profile, prompt, and font. The second has the new-tab menu open, so each
+# profile's icon is visible, such as Ubuntu's and GitHub Copilot's.
+function Save-VerifyTerminalWindow {
+    param([string] $Id)
+    $className = 'CASCADIA_HOSTING_WINDOW_CLASS'
+    $existing = @([DevConfigVerifyNative]::FindTopLevelWindows($className))
+    # The default profile is what setup configures, so no profile is named here.
+    Start-Process -FilePath 'wt.exe' -ArgumentList '-w', 'new'
+    $handle = Wait-VerifyNewWindow -ClassName $className -Existing $existing
+    $files = @()
+    try {
+        # Windows started from a background process open behind others, and screen captures need it in front.
+        [DevConfigVerifyNative]::SetTopMost($handle, $true)
+        [DevConfigVerifyNative]::Arrange($handle, 1000, 460)
+        Start-Sleep -Seconds 6
+        $name = "$Id-1.png"
+        Save-VerifyWindowImage -Handle $handle -Path (Join-Path $screenshotDir $name)
+        $files += $name
+
+        try {
+            # The button's tooltip opens above it when there's room, and below it, over the menu, when there isn't.
+            # Taller, so a long profile list fits inside the window.
+            [DevConfigVerifyNative]::Arrange($handle, 1000, 680, 120)
+            Start-Sleep -Seconds 1
+            $menu = Open-VerifyTerminalNewTabMenu -Handle $handle
+            if ($menu) {
+                try {
+                    $name = "$Id-2.png"
+                    Save-VerifyWindowImage -Handle $handle -Path (Join-Path $screenshotDir $name) -ScreenOnly
+                    $files += $name
+                } finally {
+                    try { $menu.Collapse() } catch { Write-Verbose "Could not close Terminal's new-tab menu: $($_.Exception.Message)" }
+                }
+            }
+        } catch {
+            Write-Host "    Couldn't capture the new-tab menu: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } finally {
+        [DevConfigVerifyNative]::Close($handle)
+    }
+    return , $files
+}
+
 function Invoke-VerifyScreenshots {
     Initialize-VerifyCapture
     $names = @($Script:VerifyResults | ForEach-Object { $_.Name })
@@ -1758,9 +2360,7 @@ function Invoke-VerifyScreenshots {
                     if (-not (Get-Command -Name wt.exe -ErrorAction SilentlyContinue)) {
                         throw 'Windows Terminal (wt.exe) is not installed.'
                     }
-                    # The default profile is what setup configures, so no profile is named here.
-                    $record.Images = Save-VerifyNewWindow -Id $panel.Id -ClassName 'CASCADIA_HOSTING_WINDOW_CLASS' `
-                        -Launch { Start-Process -FilePath 'wt.exe' -ArgumentList '-w', 'new' } -WidthDip 1000 -HeightDip 460 -SettleSeconds 6
+                    $record.Images = Save-VerifyTerminalWindow -Id $panel.Id
                 }
                 'Explorer' {
                     $record.Images = Save-VerifyNewWindow -Id $panel.Id -ClassName 'CabinetWClass' `
@@ -2053,6 +2653,16 @@ $Script:DevConfigWorkload = $Workload
 $Script:DevConfigResumed = $false
 $Script:DevConfigAllowUnsigned = $true
 
+# A run takes longer than a typical display timeout, and Terminal stops drawing while the display is off.
+if (-not $NoScreenshots) {
+    try {
+        if (-not ('DevConfigVerifyNative' -as [type])) { Add-Type -TypeDefinition $nativeSource }
+        [DevConfigVerifyNative]::KeepDisplayOn($true)
+    } catch {
+        Write-Verbose "Could not keep the display on: $($_.Exception.Message)"
+    }
+}
+
 Write-Host ''
 Write-Host "Verifying $($definition['Name']) ($Experience experience, -Action $Action)" -ForegroundColor Cyan
 Write-Host "  Definitions: $ConfigSource" -ForegroundColor DarkGray
@@ -2084,6 +2694,24 @@ foreach ($phase in $phases) {
 }
 
 $panels = @()
+
+# What Terminal's new-tab menu shows for the profiles setup creates. These are quick reads, so they always run.
+$stepNames = @($Script:VerifyResults | ForEach-Object { $_.Name })
+if ($stepNames -contains 'WslUbuntu' -or $stepNames -contains 'GitHubCopilotProfile') {
+    $Script:DevConfigPhaseTitle = 'Windows Terminal profiles'
+    Write-Host ''
+    Write-Host $Script:DevConfigPhaseTitle -ForegroundColor Cyan
+    try {
+        Invoke-VerifyTerminalProfileChecks -Steps $stepNames
+    } catch {
+        $failed = New-VerifyResult -Name 'TerminalProfiles' -Title 'Windows Terminal profiles'
+        $failed.Status = 'Error'
+        $failed.Actual = "Couldn't check"
+        $failed.Message = $_.Exception.Message
+        Add-VerifyResult -Result $failed
+    }
+}
+
 # Each smoke test runs when its package is part of the workload being verified.
 $smokeTests = @(
     @{ Package = 'PowerToys'; Title = 'PowerToys smoke test'; Run = { Invoke-VerifyPowerToysSmokeTest } }
@@ -2112,6 +2740,8 @@ if (-not $NoScreenshots) {
         $panels = Invoke-VerifyScreenshots
     } catch {
         Write-Host "  Screenshots skipped: $($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        if ('DevConfigVerifyNative' -as [type]) { [DevConfigVerifyNative]::KeepDisplayOn($false) }
     }
 }
 
