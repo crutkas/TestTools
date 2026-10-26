@@ -50,6 +50,8 @@ Each step gets one of three results:
   - Other steps show setup's own pass/fail check.
 - **Functional probes.** Every package is also probed directly, for example with `uv --version`, by looking up its MSIX registration, by reading the VC++ runtime key, or by searching installed programs. Tools installed outside WinGet are recognized, and versions still appear when only `winget.exe` is available. When setup's exact check fails for the Oh My Posh profile or the Copilot Terminal profile, the script also looks for the same outcome reached another way.
 - **WinGet.** A WinGet that runs but is older than setup's pinned release is reported as set up differently, with an update available, rather than as a failure. A WinGet that's missing or doesn't report a version still fails.
+
+  WinGet also needs its downloaded package index for `winget list`. A separate row checks that the index opens. When it doesn't, every package is checked directly instead (for example with `uv --version`), so the report still says what's installed. An offline machine is flagged as set up differently, because WinGet downloads the index on its own once it's online. An online machine whose index still won't open fails, with the command that resets it.
 - **Copilot plugins.** The marketplace step passes when `copilot plugin marketplace list` shows `win-dev-skills` or `awesome-copilot`. The WinUI plugin step passes for `winui@win-dev-skills` or `winui@awesome-copilot`. Older setups used awesome-copilot.
 
   When `copilot plugin list` doesn't show the plugin, the script reads Copilot's user `settings.json` (in `%COPILOT_HOME%`, or `%USERPROFILE%\.copilot`). Copilot installs plugins listed there the next time it starts interactively, so this is expected:
@@ -72,7 +74,7 @@ Each step gets one of three results:
   - A new Windows Terminal window, showing the default profile, prompt, and font. A second capture opens Terminal's new-tab menu so each profile's icon is visible, such as Ubuntu's and GitHub Copilot's. The menu is captured from the screen, so it's skipped while the screen is locked.
   - File Explorer, plus the Folder Options General and View tabs.
 
-  It closes every window it opened. Folder Options is closed without applying anything. While it runs, it keeps the display from turning off, because apps such as Terminal stop drawing when the display is off. It never moves the mouse or types.
+  It closes every window it opened. Folder Options is closed without applying anything. While it runs, it keeps the display from turning off, because apps such as Terminal stop drawing when the display is off. It never moves the mouse or types, so it can't turn on a display that's already off: start it with the display on.
 - **Baseline.** `-Baseline` puts a previous run's results and screenshots beside the current ones and flags every check whose status changed. A clean-VM run makes a good golden baseline.
 
 ## PowerToys smoke test

@@ -284,6 +284,10 @@ function Invoke-DevConfigSteps {
     }
     foreach ($step in $Steps) {
         Add-VerifyResult -Result (Test-VerifyStep -Step $step)
+        # Checked once here, before the packages that depend on it.
+        if ($step.Name -eq 'WinGet') {
+            Add-VerifyResult -Result (Test-VerifyWinGetSource)
+        }
     }
 }
 
@@ -688,6 +692,52 @@ function Get-VerifyRegistryValue {
     return Format-VerifyValue -Value $key.GetValue($ValueName)
 }
 
+# WinGet needs its downloaded package index for list, install, and upgrade. A failure is recorded up front so
+# package checks skip WinGet's retries and check each tool directly.
+function Test-VerifyWinGetSource {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $result = New-VerifyResult -Name 'WinGetSource' -Title 'WinGet can open its package index'
+    $result.Expected = 'The winget source opens'
+    try {
+        if (-not (Get-Command -Name winget.exe -ErrorAction SilentlyContinue)) {
+            $result.Status = 'Skip'
+            $result.Actual = "winget isn't available"
+            return $result
+        }
+        $run = Invoke-DevConfigWingetCli -Arguments @('list', '--id', 'Microsoft.WindowsTerminal', '--exact', '--source', 'winget', '--accept-source-agreements')
+        if ($run.ExitCode -eq 0 -or $run.ExitCode -eq $Script:DevConfigWingetNotFound) {
+            $result.Status = 'Pass'
+            $result.Actual = 'Opens'
+            return $result
+        }
+        $code = '0x{0:X8}' -f $run.ExitCode
+        $Script:DevConfigWingetSourceFailure = "WinGet's package index isn't available ($code)."
+        $online = $true
+        try {
+            [void][Net.Dns]::GetHostAddresses('cdn.winget.microsoft.com')
+        } catch {
+            $online = $false
+        }
+        if (-not $online) {
+            # WinGet downloads the index by itself once it can reach it, so this isn't a setup failure.
+            $result.Status = 'Warn'
+            $result.Actual = 'Offline, so WinGet has no package index'
+            $result.Message = "WinGet downloads its index from cdn.winget.microsoft.com, which this machine can't reach. Until it can, winget list, install, and upgrade fail ($code), so the packages below were checked by running each tool directly."
+        } else {
+            $result.Status = 'Fail'
+            $result.Actual = "winget list fails ($code)"
+            $result.Message = "WinGet can reach its source but can't open it, so setup can't check or update packages. From an elevated prompt, run: winget source reset --force"
+        }
+    } catch {
+        $result.Status = 'Error'
+        $result.Actual = "Couldn't check"
+        $result.Message = $_.Exception.Message
+    } finally {
+        $result.Seconds = [math]::Round($timer.Elapsed.TotalSeconds, 1)
+    }
+    return $result
+}
+
 function Get-VerifyPackageState {
     param([string] $Id)
     if ($Script:DevConfigWinGetMode -eq 'Module') {
@@ -738,11 +788,31 @@ function Test-VerifyStep {
             $result.Title = $Step.Name
             $result.Detail = $id
             $result.Expected = 'Installed'
-            $state = Get-VerifyPackageState -Id $id
+            $state = $null
+            try {
+                $state = Get-VerifyPackageState -Id $id
+            } catch {
+                # Without its package index WinGet can't list anything, so the tool itself is checked instead.
+                if (-not $Script:DevConfigWingetSourceFailure) { throw }
+            }
             $probe = Invoke-VerifyPackageProbe -Name $Step.Name -Id $id
             if ($probe) { $result.Probe = $probe.Text }
-            $version = if ($state.Version) { $state.Version } elseif ($probe -and $probe.Ok) { $probe.Version } else { '' }
-            if ($state.State -eq 'Absent') {
+            $version = if ($state -and $state.Version) { $state.Version } elseif ($probe -and $probe.Ok) { $probe.Version } else { '' }
+            if (-not $state) {
+                if (-not $probe) {
+                    $result.Status = 'Error'
+                    $result.Actual = "Couldn't check"
+                    $result.Message = "WinGet's package index isn't available, and this package has no direct check."
+                } elseif ($probe.Ok) {
+                    $result.Status = 'Pass'
+                    $result.Actual = "Works$(if ($version) { " ($version)" })"
+                    $result.Message = "WinGet's package index isn't available, so this was checked directly."
+                } else {
+                    $result.Status = 'Fail'
+                    $result.Actual = 'Not found'
+                    $result.Message = "WinGet's package index isn't available, and the direct check didn't find it."
+                }
+            } elseif ($state.State -eq 'Absent') {
                 if ($probe -and $probe.Ok) {
                     $result.Status = 'Warn'
                     $result.Actual = "Works$(if ($version) { " ($version)" }), not installed through WinGet"
